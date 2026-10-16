@@ -28,8 +28,9 @@
 using namespace std;
 
 class GraphCalendarWorker : public CalendarSyncWorker {
-    // Like every MailStore user this is bound to the thread that constructed the worker.
-    unique_ptr<MailStore> store;
+    // Bound to the thread that constructed the worker, like every MailStore; never freed
+    // (see the constructor).
+    MailStore * store;
     shared_ptr<Account> account;
     shared_ptr<spdlog::logger> logger;
 
@@ -38,7 +39,7 @@ class GraphCalendarWorker : public CalendarSyncWorker {
     void syncCalendarList();
     void syncCalendar(shared_ptr<Calendar> calendar);
     void runDelta(shared_ptr<Calendar> calendar, const string & startURL, const GraphDeltaState & window, bool full);
-    void applyDeltaPage(shared_ptr<Calendar> calendar, const json & items, set<string> * seenEventIds);
+    size_t applyDeltaPage(shared_ptr<Calendar> calendar, const json & items, set<string> * seenEventIds);
     void removeEvents(vector<string> eventIds);
     void removeEventsNotIn(const string & calendarId, const set<string> & keepEventIds);
     void removeCalendar(shared_ptr<Calendar> calendar);

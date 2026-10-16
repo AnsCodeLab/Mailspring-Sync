@@ -3,6 +3,8 @@
 // -DMAILSYNC_BUILD_TESTS=ON; plain checks, no test framework.
 
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -417,6 +419,215 @@ static void testTokenCache() {
     CHECK(cache.lookup("acct", OAuthResource::Graph, now, 60, out));
 }
 
+static void setZone(const char * zone) {
+    setenv("TZ", zone, 1);
+    tzset();
+}
+
+// Local-midnight instant of a calendar day in the current process time zone.
+static long long localMidnight(int year, int month, int day) {
+    tm parts {};
+    parts.tm_year = year - 1900;
+    parts.tm_mon = month - 1;
+    parts.tm_mday = day;
+    parts.tm_isdst = -1;
+    return (long long)mktime(&parts);
+}
+
+static void testUtcBoundsUnderTimeZones() {
+    printf("rs/re under non-UTC process time zones\n");
+    json timed = baseEvent();
+    timed["start"] = {{"dateTime", "2025-01-15T09:00:00.0000000"}, {"timeZone", "UTC"}};
+    timed["end"] = {{"dateTime", "2025-01-15T10:00:00.0000000"}, {"timeZone", "UTC"}};
+    const long long trueStart = 1736931600;  // 2025-01-15T09:00:00Z
+    const long long trueEnd = 1736935200;    // 2025-01-15T10:00:00Z
+
+    json allDay = baseEvent();
+    allDay["isAllDay"] = true;
+    allDay["start"] = {{"dateTime", "2025-01-16T00:00:00.0000000"}, {"timeZone", "UTC"}};
+    allDay["end"] = {{"dateTime", "2025-01-17T00:00:00.0000000"}, {"timeZone", "UTC"}};
+
+    const char * zones[] = {"UTC", "Asia/Ho_Chi_Minh", "America/Los_Angeles"};
+    for (const char * zone : zones) {
+        setZone(zone);
+        printf("  TZ=%s\n", zone);
+
+        long long rs = 0, re = 0;
+        CHECK(GraphEventUnixBounds(timed, rs, re));
+        CHECK(rs == trueStart);
+        CHECK(re == trueEnd);
+
+        // The library alone reads the same text as local time, which is the bug the helper fixes.
+        auto cal = parse(GraphEventToICS(timed));
+        long long libraryStart = cal->Events.front()->DtStart.toUnix();
+        if (string(zone) == "UTC") {
+            CHECK(libraryStart == trueStart);
+        } else {
+            CHECK(libraryStart != trueStart);
+        }
+
+        // All-day events keep local-midnight bounds from the library and get no UTC override.
+        long long ars = -1, are = -1;
+        CHECK(!GraphEventUnixBounds(allDay, ars, are));
+        CHECK(ars == -1 && are == -1);
+        auto dayCal = parse(GraphEventToICS(allDay));
+        CHECK(dayCal->Events.front()->DtStart.toUnix() == localMidnight(2025, 1, 16));
+        CHECK(dayCal->Events.front()->DtEnd.toUnix() == localMidnight(2025, 1, 17));
+    }
+    setZone("UTC");
+
+    // different zones really do give different local midnights (the check above is not vacuous)
+    setZone("Asia/Ho_Chi_Minh");
+    long long hcm = localMidnight(2025, 1, 16);
+    setZone("America/Los_Angeles");
+    long long la = localMidnight(2025, 1, 16);
+    CHECK(hcm != la);
+    setZone("UTC");
+
+    // missing end: re falls back to rs; unusable start yields no override
+    json noEnd = timed;
+    noEnd.erase("end");
+    long long rs = 0, re = 0;
+    CHECK(GraphEventUnixBounds(noEnd, rs, re));
+    CHECK(rs == trueStart && re == trueStart);
+    json bad = timed;
+    bad["start"] = {{"dateTime", "garbage"}, {"timeZone", "UTC"}};
+    CHECK(!GraphEventUnixBounds(bad, rs, re));
+}
+
+static void testZoneNames() {
+    printf("time zone names\n");
+    auto accepts = [](const char * zone) {
+        json ev = baseEvent();
+        ev["start"]["timeZone"] = zone;
+        ev["end"]["timeZone"] = zone;
+        try {
+            GraphEventToICS(ev);
+        } catch (invalid_argument &) {
+            return false;
+        }
+        return true;
+    };
+    CHECK(accepts("UTC"));
+    CHECK(accepts("utc"));
+    CHECK(accepts("Etc/UTC"));
+    CHECK(accepts("ETC/utc"));
+    CHECK(accepts("tzone://Microsoft/Utc"));
+    CHECK(accepts("Greenwich Standard Time"));
+    CHECK(accepts("greenwich standard time"));
+    CHECK(!accepts("GMT Standard Time"));       // London: observes DST
+    CHECK(!accepts("UTC+01:00"));
+    CHECK(!accepts("Etc/UTC-1"));
+    CHECK(!accepts("Pacific Standard Time"));
+    CHECK(!accepts("W. Europe Standard Time"));
+}
+
+static void testConverterEdgeCases() {
+    printf("converter edge cases\n");
+
+    // missing end: no DTEND line, the library reports an empty end
+    json noEnd = baseEvent();
+    noEnd.erase("end");
+    string ics = GraphEventToICS(noEnd);
+    CHECK(!contains(ics, "DTEND"));
+    CHECK(parse(ics)->Events.front()->DtEnd.IsEmpty());
+    CHECK(hasLine(ics, "DTSTART:20250115T103000Z"));
+
+    // empty subject stays a (blank) SUMMARY and parses
+    json empty = baseEvent();
+    empty["subject"] = "";
+    ics = GraphEventToICS(empty);
+    CHECK(hasLine(ics, "SUMMARY:"));
+    CHECK_EQ(parse(ics)->Events.front()->Summary, "");
+
+    // DTSTAMP fallback is deterministic: start for timed, midnight of the start date for all-day
+    json noStamp = baseEvent();
+    noStamp.erase("lastModifiedDateTime");
+    ics = GraphEventToICS(noStamp);
+    CHECK(hasLine(ics, "DTSTAMP:20250115T103000Z"));
+    CHECK(!contains(ics, "LAST-MODIFIED"));
+    CHECK_EQ(ics, GraphEventToICS(noStamp));
+    json created = noStamp;
+    created["createdDateTime"] = "2025-01-01T01:02:03.0000000Z";
+    CHECK(hasLine(GraphEventToICS(created), "DTSTAMP:20250101T010203Z"));
+    json dayNoStamp = noStamp;
+    dayNoStamp["isAllDay"] = true;
+    dayNoStamp["start"] = {{"dateTime", "2025-01-16T00:00:00.0000000"}, {"timeZone", "UTC"}};
+    dayNoStamp["end"] = {{"dateTime", "2025-01-17T00:00:00.0000000"}, {"timeZone", "UTC"}};
+    CHECK(hasLine(GraphEventToICS(dayNoStamp), "DTSTAMP:20250116T000000Z"));
+
+    // all-day event that does not start at midnight: date part used, warning reported
+    json odd = baseEvent();
+    odd["isAllDay"] = true;
+    odd["start"] = {{"dateTime", "2025-01-16T08:00:00.0000000"}, {"timeZone", "UTC"}};
+    odd["end"] = {{"dateTime", "2025-01-17T08:00:00.0000000"}, {"timeZone", "UTC"}};
+    vector<string> warnings;
+    ics = GraphEventToICS(odd, &warnings);
+    CHECK(hasLine(ics, "DTSTART;VALUE=DATE:20250116"));
+    CHECK(warnings.size() == 1);
+    CHECK(!warnings.empty() && contains(warnings[0], "080000"));
+    warnings.clear();
+    json midnight = odd;
+    midnight["start"]["dateTime"] = "2025-01-16T00:00:00.0000000";
+    GraphEventToICS(midnight, &warnings);
+    CHECK(warnings.empty());
+
+    // organizer's own response counts as accepted; other attendee responses unchanged
+    json org = baseEvent();
+    org["attendees"] = json::array({
+        {{"type", "required"}, {"status", {{"response", "organizer"}}}, {"emailAddress", {{"name", "Alice Org"}, {"address", "alice@example.com"}}}},
+        {{"type", "required"}, {"status", {{"response", "notResponded"}}}, {"emailAddress", {{"name", "Bob"}, {"address", "bob@example.com"}}}},
+    });
+    string flat = unfold(GraphEventToICS(org));
+    CHECK(contains(flat, "PARTSTAT=ACCEPTED;CN=\"Alice Org\":mailto:alice@example.com"));
+    CHECK(contains(flat, "PARTSTAT=NEEDS-ACTION;CN=\"Bob\":mailto:bob@example.com"));
+
+    // a control character in the id would break out of the UID content line
+    json ctl = baseEvent();
+    ctl["id"] = string("AAMk\r\nATTENDEE:mailto:evil@example.com");
+    bool threw = false;
+    try {
+        GraphEventToICS(ctl);
+    } catch (invalid_argument &) {
+        threw = true;
+    }
+    CHECK(threw);
+    ctl["id"] = string("AAMk\tTab");
+    threw = false;
+    try {
+        GraphEventToICS(ctl);
+    } catch (invalid_argument &) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+static void testUrlTrustAndStaleToken() {
+    printf("trusted urls / stale token / unusable pass\n");
+    CHECK(GraphIsTrustedURL("https://graph.microsoft.com/v1.0/me/calendars"));
+    CHECK(GraphIsTrustedURL("https://graph.microsoft.com/v1.0/me/calendars/X/calendarView/delta?$deltatoken=a"));
+    CHECK(!GraphIsTrustedURL(""));
+    CHECK(!GraphIsTrustedURL("http://graph.microsoft.com/v1.0/me"));
+    CHECK(!GraphIsTrustedURL("https://graph.microsoft.com"));
+    CHECK(!GraphIsTrustedURL("https://graph.microsoft.com.evil.example/v1.0/me"));
+    CHECK(!GraphIsTrustedURL("https://graph.microsoft.com@evil.example/v1.0/me"));
+    CHECK(!GraphIsTrustedURL("https://evil.example/https://graph.microsoft.com/"));
+    CHECK(!GraphIsTrustedURL("HTTPS://GRAPH.MICROSOFT.COM/v1.0"));  // strict: Graph returns lower case
+    CHECK(!GraphIsTrustedURL("https://graph.microsoft.de/v1.0/me"));
+
+    CHECK(GraphStatusMeansStaleDeltaToken("Invalid Response Code: 410"));
+    CHECK(GraphStatusMeansStaleDeltaToken("Invalid Response Code: 400"));
+    CHECK(!GraphStatusMeansStaleDeltaToken("Invalid Response Code: 404"));
+    CHECK(!GraphStatusMeansStaleDeltaToken("Invalid Response Code: 500"));
+    CHECK(!GraphStatusMeansStaleDeltaToken("Invalid Response Code: 401"));
+
+    CHECK(!GraphPassUnusable(0, 0));   // nothing received: nothing wrong
+    CHECK(!GraphPassUnusable(5, 0));
+    CHECK(!GraphPassUnusable(5, 4));
+    CHECK(GraphPassUnusable(5, 5));
+    CHECK(GraphPassUnusable(1, 1));
+}
+
 int main() {
     testTimedEvent();
     testAllDayEvent();
@@ -429,6 +640,10 @@ int main() {
     testInvalidInput();
     testDeltaBookkeeping();
     testTokenCache();
+    testUtcBoundsUnderTimeZones();
+    testZoneNames();
+    testConverterEdgeCases();
+    testUrlTrustAndStaleToken();
 
     printf("%d checks, %d failure(s)\n", checks, failures);
     return failures == 0 ? 0 : 1;

@@ -68,6 +68,8 @@ const json MakeOAuthRefreshRequest(string provider, string clientId, string refr
         : "";
     curl_easy_setopt(curl_handle, CURLOPT_URL, url);
     curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 20);
+    // Bounds the whole exchange: the token manager holds a global lock while this runs.
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 60L);
 
     char * c = curl_easy_escape(curl_handle, clientId.c_str(), 0);
     char * r = curl_easy_escape(curl_handle, refreshToken.c_str(), 0);

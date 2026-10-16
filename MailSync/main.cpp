@@ -786,15 +786,19 @@ void runListenOnMainThread(shared_ptr<Account> account) {
                 if (runningCalendarSync.compare_exchange_strong(expected, true)) {
                     std::thread([account]() {
                         SetThreadName("calendar");
-                        auto worker = makeCalendarSyncWorker(account);
+                        // Released on every exit path, including exceptions.
+                        struct RunningFlagReset {
+                            atomic<bool> & flag;
+                            ~RunningFlagReset() { flag = false; }
+                        } reset { runningCalendarSync };
                         try {
-                            worker->run();
+                            makeCalendarSyncWorker(account)->run();
                         } catch (SyncException & ex) {
-                            // Graph failures are reported in the log instead of ending the process.
-                            if (!ProviderUsesGraphCalendar(account->provider())) throw;
-                            spdlog::get("logger")->error("Calendar sync failed: {}", ex.toJSON().dump());
+                            // An uncaught exception on this detached thread would end the process.
+                            spdlog::get("logger")->error("Calendar sync failed: {}", ex.toJSON().dump(-1, ' ', false, json::error_handler_t::replace));
+                        } catch (...) {
+                            exceptions::logCurrentExceptionWithStackTrace();
                         }
-                        runningCalendarSync = false;
                     }).detach();
                 }
             }

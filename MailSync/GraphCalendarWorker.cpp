@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <exception>
+#include <mutex>
 #include <set>
 #include <thread>
 
@@ -47,6 +48,11 @@ static string graphRetryAfterHeader() {
     return first == string::npos ? "" : value.substr(first);
 }
 
+// Log/diagnostic dumps include HTTP bodies, which need not be valid UTF-8.
+static string safeDump(const json & j) {
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
 static string stringValue(const json & j, const char * key) {
     if (!j.is_object()) return "";
     auto it = j.find(key);
@@ -71,6 +77,9 @@ static bool isCalendarSpecificFailure(const SyncException & e) {
            (hasStatus(e, "Code: 403") && e.debuginfo.find("ErrorAccessDenied") != string::npos);
 }
 
+// The store is deliberately never freed, like the other workers': the long-lived instance is
+// used by a thread that is still running when the process exits, and a destructor racing that
+// thread would close the database under it.
 GraphCalendarWorker::GraphCalendarWorker(shared_ptr<Account> account) :
     store(new MailStore()),
     account(account),
@@ -79,11 +88,20 @@ GraphCalendarWorker::GraphCalendarWorker(shared_ptr<Account> account) :
 }
 
 void GraphCalendarWorker::run() {
+    // The periodic loop and the sync-calendar trigger each own a worker; two concurrent passes
+    // would race on the same calendars.
+    static mutex passLock;
+    lock_guard<mutex> guard(passLock);
     syncCalendarList();
 }
 
 // GET with a Graph access token, retrying 429/503 after a bounded Retry-After wait.
 json GraphCalendarWorker::graphGet(const string & url) {
+    if (!GraphIsTrustedURL(url)) {
+        // The bearer token must never leave graph.microsoft.com.
+        throw SyncException("graph-untrusted-url", "Refusing to send Graph credentials to " + url.substr(0, 200), false);
+    }
+
     for (int attempt = 1;; attempt++) {
         auto token = SharedXOAuth2TokenManager()->partsForAccount(account, OAuthResource::Graph);
 
@@ -114,7 +132,7 @@ void GraphCalendarWorker::syncCalendarList() {
     while (!url.empty()) {
         json page = graphGet(url);
         if (!page.is_object() || !page.contains("value") || !page["value"].is_array()) {
-            throw SyncException("graph-bad-response", "Calendar list had no value array: " + page.dump().substr(0, 500), true);
+            throw SyncException("graph-bad-response", "Calendar list had no value array: " + safeDump(page).substr(0, 500), true);
         }
         for (auto & item : page["value"]) {
             if (!stringValue(item, "id").empty()) remote.push_back(item);
@@ -133,7 +151,6 @@ void GraphCalendarWorker::syncCalendarList() {
 
         string name = stringValue(item, "name");
         string color = GraphCalendarColor(stringValue(item, "hexColor"), stringValue(item, "color"));
-        bool readOnly = !(item.contains("canEdit") && item["canEdit"].is_boolean() && item["canEdit"].get<bool>());
 
         shared_ptr<Calendar> calendar = local.count(id) ? local[id] : nullptr;
         bool changed = false;
@@ -151,8 +168,11 @@ void GraphCalendarWorker::syncCalendarList() {
         if (changed || calendar->color() != previousColor) {
             changed = true;
         }
-        if (changed || calendar->readOnly() != readOnly) {
-            calendar->setReadOnly(readOnly);
+        // Event writes are rejected for these accounts (see TaskProcessor), so every calendar
+        // is stored read-only whatever Graph's canEdit says; the UI then offers no edits that
+        // would fail.
+        if (changed || !calendar->readOnly()) {
+            calendar->setReadOnly(true);
             changed = true;
         }
         if (changed) {
@@ -175,13 +195,21 @@ void GraphCalendarWorker::syncCalendarList() {
     }
 
     exception_ptr pending = nullptr;
+    bool warnedAccessDenied = false;
     for (auto & calendar : toSync) {
         try {
             syncCalendar(calendar);
         } catch (SyncException & e) {
             if (isAuthFailure(e)) throw;
             if (isCalendarSpecificFailure(e)) {
-                logger->warn("Skipping calendar '{}': {}", calendar->name(), e.toJSON().dump());
+                if (hasStatus(e, "Code: 403") && !warnedAccessDenied) {
+                    warnedAccessDenied = true;
+                    logger->warn("Microsoft Graph denied access (ErrorAccessDenied) to calendar '{}'; skipping it. "
+                                 "If this affects calendars that should be readable, the Calendars.ReadWrite.Shared "
+                                 "permission may not be granted for this account.", calendar->name());
+                } else {
+                    logger->info("Skipping calendar '{}': {}", calendar->name(), safeDump(e.toJSON()));
+                }
             } else if (!pending) {
                 pending = current_exception();
             }
@@ -194,16 +222,15 @@ void GraphCalendarWorker::syncCalendar(shared_ptr<Calendar> calendar) {
     auto range = getCalendarSyncRange();
     string token = calendar->syncToken();
 
-    if (!GraphNeedsFullResync(token, range.start)) {
-        GraphDeltaState state;
-        GraphDeltaStateFromToken(token, state);
+    GraphDeltaState state;
+    if (!GraphNeedsFullResync(token, range.start) && GraphDeltaStateFromToken(token, state) && GraphIsTrustedURL(state.deltaLink)) {
         try {
             runDelta(calendar, state.deltaLink, state, false);
             return;
         } catch (SyncException & e) {
-            // syncStateNotFound: the delta token expired server-side.
-            if (!hasStatus(e, "Code: 410")) throw;
-            logger->info("Delta token for calendar '{}' expired; resyncing in full", calendar->name());
+            // 410 syncStateNotFound: the delta token expired server-side; 400: Graph rejects it.
+            if (!GraphStatusMeansStaleDeltaToken(e.key)) throw;
+            logger->info("Delta token for calendar '{}' rejected ({}); resyncing in full", calendar->name(), e.key);
         }
     }
 
@@ -220,14 +247,15 @@ void GraphCalendarWorker::runDelta(shared_ptr<Calendar> calendar, const string &
     string next = startURL;
     string deltaLink;
     size_t items = 0;
+    size_t skipped = 0;
 
     while (!next.empty()) {
         json page = graphGet(next);
         if (!page.is_object() || !page.contains("value") || !page["value"].is_array()) {
-            throw SyncException("graph-bad-response", "Delta page had no value array: " + page.dump().substr(0, 500), true);
+            throw SyncException("graph-bad-response", "Delta page had no value array: " + safeDump(page).substr(0, 500), true);
         }
         items += page["value"].size();
-        applyDeltaPage(calendar, page["value"], full ? &seen : nullptr);
+        skipped += applyDeltaPage(calendar, page["value"], full ? &seen : nullptr);
 
         next = stringValue(page, "@odata.nextLink");
         if (next.empty()) {
@@ -236,6 +264,13 @@ void GraphCalendarWorker::runDelta(shared_ptr<Calendar> calendar, const string &
     }
     if (deltaLink.empty()) {
         throw SyncException("graph-bad-response", "Delta response ended without a deltaLink", true);
+    }
+    if (!GraphIsTrustedURL(deltaLink)) {
+        throw SyncException("graph-untrusted-url", "Delta response returned a deltaLink outside graph.microsoft.com", false);
+    }
+    if (GraphPassUnusable(items, skipped)) {
+        // Neither purge nor advance the token: the next pass retries from the same point.
+        throw SyncException("graph-bad-response", "Calendar '" + calendar->name() + "': all " + to_string(items) + " received event(s) were unusable", true);
     }
 
     if (full) {
@@ -257,40 +292,66 @@ struct DeltaOp {
     string etag;
     string ics;              // CRLF text that is stored
     shared_ptr<ICalendar> parsed;
+    bool hasUtcBounds = false;
+    long long rs = 0;
+    long long re = 0;
 };
+
+// applyICSEventData derives rs/re with Date::toUnix(), which reads a `Z` time as local time.
+// For timed events the true UTC instants replace them; all-day events keep the local-midnight
+// bounds the app's day windows expect.
+void applyUtcBounds(Event & event, const DeltaOp & op) {
+    if (!op.hasUtcBounds) return;
+    event._data["rs"] = op.rs;
+    event._data["re"] = op.re;
+}
 }
 
-void GraphCalendarWorker::applyDeltaPage(shared_ptr<Calendar> calendar, const json & items, set<string> * seenEventIds) {
+// Returns how many non-removal items could not be converted and were skipped.
+size_t GraphCalendarWorker::applyDeltaPage(shared_ptr<Calendar> calendar, const json & items, set<string> * seenEventIds) {
     // Convert and parse outside the transaction so the write lock is held only for the saves.
     vector<DeltaOp> ops;
+    size_t skipped = 0;
     for (auto & item : items) {
         DeltaOp op;
         op.graphId = stringValue(item, "id");
         if (op.graphId.empty()) continue;
 
+        string eventId = MailUtils::idForEvent(account->id(), calendar->id(), GraphEventUID(op.graphId), "");
         if (item.contains("@removed")) {
             op.remove = true;
-            op.eventId = MailUtils::idForEvent(account->id(), calendar->id(), GraphEventUID(op.graphId), "");
+            op.eventId = eventId;
             ops.push_back(op);
             continue;
         }
 
+        // Recorded before conversion: an event the server still lists but this build cannot
+        // convert must survive a full resync's purge of events that are gone.
+        if (seenEventIds) seenEventIds->insert(eventId);
+
+        vector<string> warnings;
         try {
-            op.ics = GraphEventToICS(item);
+            op.ics = GraphEventToICS(item, &warnings);
         } catch (invalid_argument & e) {
             logger->warn("Skipping Graph event {}: {}", op.graphId, e.what());
+            skipped++;
             continue;
+        }
+        for (auto & warning : warnings) {
+            logger->warn("Graph event {}: {}", op.graphId, warning);
         }
         op.etag = stringValue(item, "changeKey");
         op.parsed = make_shared<ICalendar>(ICSStripCR(op.ics));
         if (op.parsed->Events.empty() || op.parsed->Events.front()->DtStart.IsEmpty()) {
             logger->warn("Skipping Graph event {}: generated ICS has no start", op.graphId);
+            skipped++;
             continue;
         }
+        op.hasUtcBounds = GraphEventUnixBounds(item, op.rs, op.re);
         ops.push_back(op);
     }
 
-    MailStoreTransaction transaction{store.get(), "GraphCalendarWorker:applyDeltaPage"};
+    MailStoreTransaction transaction{store, "GraphCalendarWorker:applyDeltaPage"};
     for (auto & op : ops) {
         if (op.remove) {
             auto existing = store->find<Event>(Query().equal("id", op.eventId).equal("calendarId", calendar->id()));
@@ -300,26 +361,28 @@ void GraphCalendarWorker::applyDeltaPage(shared_ptr<Calendar> calendar, const js
 
         ICalendarEvent * icsEvent = op.parsed->Events.front();
         string eventId = MailUtils::idForEvent(account->id(), calendar->id(), icsEvent->UID, icsEvent->RecurrenceId);
-        if (seenEventIds) seenEventIds->insert(eventId);
 
         auto existing = store->find<Event>(Query().equal("id", eventId));
         if (existing) {
             // Full resyncs re-deliver everything; don't re-persist (and re-notify) what is unchanged.
             if (existing->etag() == op.etag && existing->icsData() == op.ics) continue;
             existing->applyICSEventData(op.etag, op.graphId, op.ics, icsEvent);
+            applyUtcBounds(*existing, op);
             store->save(existing.get());
         } else {
             Event event(op.etag, account->id(), calendar->id(), op.ics, icsEvent);
             event.setHref(op.graphId);
+            applyUtcBounds(event, op);
             store->save(&event);
         }
     }
     transaction.commit();
+    return skipped;
 }
 
 void GraphCalendarWorker::removeEvents(vector<string> eventIds) {
     for (auto chunk : MailUtils::chunksOfVector(eventIds, GRAPH_DB_CHUNK)) {
-        MailStoreTransaction transaction{store.get(), "GraphCalendarWorker:removeEvents"};
+        MailStoreTransaction transaction{store, "GraphCalendarWorker:removeEvents"};
         // Per-model removal so Event::afterRemove clears the EventSearch row too.
         for (auto & event : store->findAll<Event>(Query().equal("id", chunk))) {
             store->remove(event.get());
@@ -344,7 +407,7 @@ void GraphCalendarWorker::removeEventsNotIn(const string & calendarId, const set
 
 void GraphCalendarWorker::removeCalendar(shared_ptr<Calendar> calendar) {
     removeEventsNotIn(calendar->id(), {});
-    MailStoreTransaction transaction{store.get(), "GraphCalendarWorker:removeCalendar"};
+    MailStoreTransaction transaction{store, "GraphCalendarWorker:removeCalendar"};
     store->remove(calendar.get());
     transaction.commit();
 }

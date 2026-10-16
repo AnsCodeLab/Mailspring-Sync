@@ -13,15 +13,24 @@
 #define GraphEventConverter_hpp
 
 #include <string>
+#include <vector>
 #include "json.hpp"
 
 // Builds a VCALENDAR containing one VEVENT from a Graph event (as returned by
 // calendarView/delta with `Prefer: outlook.timezone="UTC"`). Occurrences of a series are
 // stored expanded, so the output never carries an RRULE.
 //
-// Throws std::invalid_argument when the event lacks an `id`, has no usable `start`, or its
-// times are not in UTC (the converter cannot apply time zone rules).
-std::string GraphEventToICS(const nlohmann::json & event);
+// Throws std::invalid_argument when the event lacks an `id` (or the id holds a control
+// character), has no usable `start`, or its times are not in UTC (the converter cannot apply
+// time zone rules). `warnings`, when given, receives messages about data that was converted
+// but looks wrong (e.g. an all-day event that does not start at midnight).
+std::string GraphEventToICS(const nlohmann::json & event, std::vector<std::string> * warnings = nullptr);
+
+// Event.rs/re for a timed Graph event: the true UTC instants of its start and end. The
+// library's Date::toUnix() reads the same text as local time, which is wrong for `Z` times.
+// Returns false for all-day events (their bounds are local midnights, which is what the app's
+// day windows use, so the library's value is kept) and for unusable input.
+bool GraphEventUnixBounds(const nlohmann::json & event, long long & rs, long long & re);
 
 // The ICS UID for a Graph event id. Every occurrence/exception of a series has its own Graph
 // id, so the UID is derived from it rather than from the shared iCalUId.

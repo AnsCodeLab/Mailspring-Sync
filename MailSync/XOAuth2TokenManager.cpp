@@ -38,8 +38,11 @@ XOAuth2TokenManager::~XOAuth2TokenManager() {
 XOAuth2Parts XOAuth2TokenManager::partsForAccount(shared_ptr<Account> account, OAuthResource resource) {
     // There's not much of a point to having two threads request the same token at once.
     // Only allow one thread to access / update the cache and make others wait until it
-    // exits. Holding the lock across the refresh also means a rotated refresh token saved by
-    // one resource is what the next resource's refresh sends.
+    // exits. The lock is held across the network refresh on purpose: a rotated refresh token
+    // saved by one resource must be the one the next refresh sends, and concurrent callers
+    // would otherwise each redeem the same token. The cost is that every account's token
+    // request queues behind a slow one, bounded by the refresh request's timeout (this manager
+    // has always worked this way).
     lock_guard<mutex> guard(_cacheLock);
 
     XOAuth2Parts cached;

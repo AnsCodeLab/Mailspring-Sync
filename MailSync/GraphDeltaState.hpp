@@ -113,6 +113,26 @@ inline std::string GraphDeltaStartURL(const std::string & graphCalendarId, time_
            "&endDateTime=" + GraphUrlEncode(GraphFormatISO8601UTC(windowEnd));
 }
 
+// The bearer token is only ever sent to Graph: nextLink/deltaLink values come from the
+// response body and are followed only when they stay on that host. The trailing '/' after the
+// host rules out "https://graph.microsoft.com@evil.example/" style userinfo tricks.
+inline bool GraphIsTrustedURL(const std::string & url) {
+    static const std::string prefix = "https://graph.microsoft.com/";
+    return url.compare(0, prefix.size(), prefix) == 0;
+}
+
+// A rejected delta token (410 syncStateNotFound, or 400 for a token Graph can no longer parse)
+// is cured by starting over; every other failure is a real error.
+inline bool GraphStatusMeansStaleDeltaToken(const std::string & exceptionKey) {
+    return exceptionKey.find("Code: 410") != std::string::npos || exceptionKey.find("Code: 400") != std::string::npos;
+}
+
+// A pass that received items yet could use none of them has misread the data; purging the
+// calendar (or advancing the token) on that basis would delete events that are really there.
+inline bool GraphPassUnusable(size_t received, size_t skipped) {
+    return received > 0 && skipped >= received;
+}
+
 // Seconds to wait before retrying a throttled (429/503) request: the server's delay-seconds
 // Retry-After, clamped so a hostile or buggy value can never park the sync thread for long.
 inline int GraphBoundedRetryAfterSec(const std::string & retryAfter, int fallbackSec = 5, int maxSec = 60) {
