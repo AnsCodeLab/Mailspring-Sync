@@ -56,7 +56,10 @@ size_t _onAppendToString(void *contents, size_t length, size_t nmemb, void *user
     return real_size;
 }
 
-const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken) {
+const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken, OAuthResource resource) {
+    if (resource == OAuthResource::Graph && provider != "office365" && provider != "outlook") {
+        throw SyncException("invalid-oauth-resource", "Microsoft Graph tokens are only available for Microsoft accounts.", false);
+    }
     CURL * curl_handle = curl_easy_init();
     const char * url =
           provider == "gmail" ? "https://www.googleapis.com/oauth2/v4/token"
@@ -76,7 +79,11 @@ const json MakeOAuthRefreshRequest(string provider, string clientId, string refr
         // workaround the fact that Microsoft's OAUTH flow allows you to authorize many scopes, but you
         // have to get a separate token for outlook (email + IMAP) and contacts / calendar / Microsoft Graph APIs
         // separately. The same refresh token will give you access tokens, but the access tokens are different.
-        payload += "&scope=https%3A%2F%2Foutlook.office.com%2FIMAP.AccessAsUser.All%20https%3A%2F%2Foutlook.office.com%2FSMTP.Send";
+        if (resource == OAuthResource::Graph) {
+            payload += "&scope=Calendars.ReadWrite%20Calendars.ReadWrite.Shared%20offline_access";
+        } else {
+            payload += "&scope=https%3A%2F%2Foutlook.office.com%2FIMAP.AccessAsUser.All%20https%3A%2F%2Foutlook.office.com%2FSMTP.Send";
+        }
     }
 
     string gmailClientId = MailUtils::getEnvUTF8("GMAIL_CLIENT_ID");
@@ -102,7 +109,7 @@ const json MakeOAuthRefreshRequest(string provider, string clientId, string refr
     return PerformJSONRequest(curl_handle);
 }
 
-CURL * CreateJSONRequest(string url, string method, string authorization, const char * payloadChars) {
+CURL * CreateJSONRequest(string url, string method, string authorization, const char * payloadChars, const vector<string> & extraHeaders) {
     CURL * curl_handle = curl_easy_init();
     curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 20);
@@ -118,6 +125,9 @@ CURL * CreateJSONRequest(string url, string method, string authorization, const 
     if (payloadChars != nullptr && strlen(payloadChars) > 0) {
         requestData->headers = curl_slist_append(requestData->headers, "Content-Type: application/json");
         curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
+    }
+    for (const string & header : extraHeaders) {
+        requestData->headers = curl_slist_append(requestData->headers, header.c_str());
     }
     curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, requestData->headers);
     curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());

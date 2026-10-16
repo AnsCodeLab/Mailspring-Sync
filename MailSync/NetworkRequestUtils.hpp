@@ -14,7 +14,10 @@
 
 #include <curl/curl.h>
 #include <stdio.h>
+#include <string>
+#include <vector>
 #include "json.hpp"
+#include "XOAuth2TokenCache.hpp"
 
 class Account;
 
@@ -26,10 +29,11 @@ size_t _onAppendToString(void *contents, size_t length, size_t nmemb, void *user
 // Helper to cleanup curl handle and associated header list stored in CURLOPT_PRIVATE
 void CleanupCurlRequest(CURL * curl_handle);
 
-CURL * CreateJSONRequest(string url, string method = "GET", string authorization = "", const char * payloadChars = nullptr);
+// `extraHeaders` are complete "Name: value" lines appended after the standard ones.
+CURL * CreateJSONRequest(string url, string method = "GET", string authorization = "", const char * payloadChars = nullptr, const vector<string> & extraHeaders = {});
 CURL * CreateCalDavRequest(string url, string method = "GET", const char * payloadChars = nullptr);
 
-const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken);
+const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken, OAuthResource resource = OAuthResource::Mail);
 
 const string PerformRequest(CURL * curl_handle);
 const json PerformJSONRequest(CURL * curl_handle);

@@ -35,27 +35,24 @@ XOAuth2TokenManager::~XOAuth2TokenManager() {
 
 
 
-XOAuth2Parts XOAuth2TokenManager::partsForAccount(shared_ptr<Account> account) {
-    string key = account->id();
-    
+XOAuth2Parts XOAuth2TokenManager::partsForAccount(shared_ptr<Account> account, OAuthResource resource) {
     // There's not much of a point to having two threads request the same token at once.
     // Only allow one thread to access / update the cache and make others wait until it
-    // exits.
+    // exits. Holding the lock across the refresh also means a rotated refresh token saved by
+    // one resource is what the next resource's refresh sends.
     lock_guard<mutex> guard(_cacheLock);
 
-    if (_cache.find(key) != _cache.end()) {
-        XOAuth2Parts parts = _cache.at(key);
-        // buffer of 60 sec since we actually need time to use the token
-        if (parts.expiryDate > time(0) + 60) {
-            return parts;
-        }
+    XOAuth2Parts cached;
+    // buffer of 60 sec since we actually need time to use the token
+    if (_cache.lookup(account->id(), resource, time(0), 60, cached)) {
+        return cached;
     }
 
     auto refreshClientId = account->refreshClientId();
     json updated {};
     if (refreshClientId != "") {
         spdlog::get("logger")->info("Fetching XOAuth2 access token ({}) for {}", account->provider(), account->id());
-        updated = MakeOAuthRefreshRequest(account->provider(), refreshClientId, account->refreshToken());
+        updated = MakeOAuthRefreshRequest(account->provider(), refreshClientId, account->refreshToken(), resource);
         updated["expiry_date"] = time(0) + updated["expires_in"].get<int>();
     } else {
         throw SyncException("invalid-xoauth2-resp", "XOAuth2 token expired and Mailspring no longer does server-side token refresh.", false);
@@ -76,6 +73,6 @@ XOAuth2Parts XOAuth2TokenManager::partsForAccount(shared_ptr<Account> account) {
     parts.username = account->IMAPUsername();
     parts.accessToken = updated["access_token"].get<string>();
     parts.expiryDate = updated["expiry_date"].get<int>();
-    _cache[key] = parts;
+    _cache.store(account->id(), resource, parts);
     return parts;
 }

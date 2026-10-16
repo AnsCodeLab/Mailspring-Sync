@@ -18,24 +18,19 @@
 #include "Account.hpp"
 #include "json.hpp"
 #include "spdlog/spdlog.h"
+#include "XOAuth2TokenCache.hpp"
 
 using namespace nlohmann;
 using namespace std;
 
-struct XOAuth2Parts {
-    string username;
-    string accessToken;
-    time_t expiryDate;
-};
-
 class XOAuth2TokenManager  {
-    map<string, XOAuth2Parts> _cache;
+    XOAuth2TokenCache _cache;
     mutex _cacheLock;
 
 public:
     XOAuth2TokenManager();
     ~XOAuth2TokenManager();
-    XOAuth2Parts partsForAccount(shared_ptr<Account> account);
+    XOAuth2Parts partsForAccount(shared_ptr<Account> account, OAuthResource resource = OAuthResource::Mail);
 };
 
 
