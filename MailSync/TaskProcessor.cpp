@@ -64,6 +64,14 @@ static void setFileModificationTime(const string & filepath, time_t timestamp) {
 #endif
 }
 
+// Event writes go to CalDAV; calendars synced through Microsoft Graph are read-only for now.
+// Failing in the local phase keeps an unsyncable event from being saved in the first place.
+static void rejectEventWriteForGraphCalendar(shared_ptr<Account> account) {
+    if (ProviderUsesGraphCalendar(account->provider())) {
+        throw SyncException("calendar-read-only", "Editing calendar events is not supported yet for Microsoft 365 accounts.", false);
+    }
+}
+
 // A helper function that can move messages between folders and update the provided
 // messages remoteUIDs, even if UIDPLUS and/or MOVE extensions are not present.
 
@@ -1191,6 +1199,7 @@ void TaskProcessor::performRemoteSyncbackContact(Task * task) {
 
 
 void TaskProcessor::performLocalSyncbackEvent(Task * task) {
+    rejectEventWriteForGraphCalendar(account);
     json & eventJSON = task->data()["event"];
     string calendarId = task->data()["calendarId"].get<string>();
 
@@ -1258,6 +1267,7 @@ void TaskProcessor::performLocalSyncbackEvent(Task * task) {
 }
 
 void TaskProcessor::performRemoteSyncbackEvent(Task * task) {
+    rejectEventWriteForGraphCalendar(account);
     string eventId = task->data()["event"]["id"].get<string>();
     auto event = store->find<Event>(Query().equal("id", eventId).equal("accountId", account->id()));
 
@@ -1270,6 +1280,7 @@ void TaskProcessor::performRemoteSyncbackEvent(Task * task) {
 }
 
 void TaskProcessor::performLocalDestroyEvent(Task * task) {
+    rejectEventWriteForGraphCalendar(account);
     vector<string> eventIds {};
     for (json & e : task->data()["events"]) {
         eventIds.push_back(e["id"].get<string>());
@@ -1281,6 +1292,7 @@ void TaskProcessor::performLocalDestroyEvent(Task * task) {
 }
 
 void TaskProcessor::performRemoteDestroyEvent(Task * task) {
+    rejectEventWriteForGraphCalendar(account);
     vector<string> eventIds {};
     for (json & e : task->data()["events"]) {
         eventIds.push_back(e["id"].get<string>());

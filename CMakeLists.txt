@@ -128,4 +128,17 @@ IF(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
   # libtidy.so.5deb1, Fedora uses libtidy.so.5, etc.)
   target_link_libraries(mailsync pthread sasl2 ssl crypto curl dl)
 
+  # Unit tests for the pure Graph calendar helpers. Off by default so the shipped build is unchanged:
+  #   cmake -DMAILSYNC_BUILD_TESTS=ON . && make graph_tests && ./graph_tests
+  option(MAILSYNC_BUILD_TESTS "Build the unit tests" OFF)
+  if(MAILSYNC_BUILD_TESTS)
+    add_executable(graph_tests
+      test/GraphEventConverterTest.cpp
+      MailSync/GraphEventConverter.cpp
+      Vendor/icalendarlib/date.cpp
+      Vendor/icalendarlib/icalendar.cpp
+      Vendor/icalendarlib/types.cpp
+    )
+  endif()
+
 ENDIF()

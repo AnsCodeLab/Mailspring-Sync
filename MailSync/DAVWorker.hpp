@@ -19,6 +19,7 @@
 #include "DavXML.hpp"
 #include "Event.hpp"
 #include "Calendar.hpp"
+#include "CalendarSyncWorker.hpp"
 
 #include <stdio.h>
 
@@ -32,7 +33,17 @@ using namespace std;
 
 typedef string ETAG;
 
-class DAVWorker {
+struct CalendarSyncRange {
+    time_t start;
+    time_t end;
+    string startStr;  // Formatted for CalDAV time-range filter
+    string endStr;
+};
+
+// The window of events kept in sync, shared by the CalDAV and Graph calendar workers.
+CalendarSyncRange getCalendarSyncRange();
+
+class DAVWorker : public CalendarSyncWorker {
     MailStore * store;
     shared_ptr<spdlog::logger> logger;
 
@@ -67,7 +78,7 @@ public:
 
     DAVWorker(shared_ptr<Account> account);
     
-    void run();
+    void run() override;
     
     shared_ptr<ContactBook> resolveAddressBook();
     string resolveCalendarHomeURL();

@@ -37,6 +37,7 @@
 #include "MetadataWorker.hpp"
 #include "MetadataExpirationWorker.hpp"
 #include "DAVWorker.hpp"
+#include "GraphCalendarWorker.hpp"
 #include "GoogleContactsWorker.hpp"
 #include "SyncException.hpp"
 #include "Task.hpp"
@@ -59,7 +60,7 @@ using option::ArgStatus;
 
 shared_ptr<SyncWorker> bgWorker = nullptr;
 shared_ptr<SyncWorker> fgWorker = nullptr;
-shared_ptr<DAVWorker> davWorker = nullptr;
+shared_ptr<CalendarSyncWorker> calendarWorker = nullptr;
 shared_ptr<GoogleContactsWorker> contactsWorker = nullptr;
 
 shared_ptr<MetadataWorker> metadataWorker = nullptr;
@@ -225,11 +226,18 @@ void runBackgroundSyncWorker() {
     }
 }
 
-void runCalContactsSyncWorker() {
+shared_ptr<CalendarSyncWorker> makeCalendarSyncWorker(shared_ptr<Account> account) {
+    if (ProviderUsesGraphCalendar(account->provider())) {
+        return make_shared<GraphCalendarWorker>(account);
+    }
+    return make_shared<DAVWorker>(account);
+}
+
+void runCalContactsSyncWorker(shared_ptr<Account> account) {
     // wait a few seconds before launching calendar / contact sync. This gives
     // mailsync a minute to kick off and avoids database locking caused by many
     // sync workers all trying to open several sqlite references at once.
-    std::this_thread::sleep_for(std::chrono::seconds(15 + davWorker->account->startDelay()));
+    std::this_thread::sleep_for(std::chrono::seconds(15 + account->startDelay()));
 
     // BG Note: This process does not use MailUtils::sleepWorkerUntilWakeOrSec(), which means
     // cal + contact sync runs every 15 minutes regardless of how often you slam on the Sync Mail
@@ -241,7 +249,7 @@ void runCalContactsSyncWorker() {
             if (contactsWorker) {
                 contactsWorker->run();
             }
-            davWorker->run();
+            calendarWorker->run();
         } catch (SyncException & ex) {
             exceptions::logCurrentExceptionWithStackTrace();
 
@@ -778,8 +786,14 @@ void runListenOnMainThread(shared_ptr<Account> account) {
                 if (runningCalendarSync.compare_exchange_strong(expected, true)) {
                     std::thread([account]() {
                         SetThreadName("calendar");
-                        auto worker = DAVWorker(account);
-                        worker.run();
+                        auto worker = makeCalendarSyncWorker(account);
+                        try {
+                            worker->run();
+                        } catch (SyncException & ex) {
+                            // Graph failures are reported in the log instead of ending the process.
+                            if (!ProviderUsesGraphCalendar(account->provider())) throw;
+                            spdlog::get("logger")->error("Calendar sync failed: {}", ex.toJSON().dump());
+                        }
                         runningCalendarSync = false;
                     }).detach();
                 }
@@ -995,8 +1009,8 @@ string exectuablePath = argv[0];
             if (account->provider() == "gmail") {
                 contactsWorker = make_shared<GoogleContactsWorker>(account);
             }
-            davWorker = make_shared<DAVWorker>(account);
-            runCalContactsSyncWorker();
+            calendarWorker = makeCalendarSyncWorker(account);
+            runCalContactsSyncWorker(account);
         });
         metadataThread = new std::thread([&]() {
              SetThreadName("metadata");

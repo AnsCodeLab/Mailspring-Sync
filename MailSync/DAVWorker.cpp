@@ -78,13 +78,6 @@ struct EventResult {
 static const int CALENDAR_SYNC_PAST_MONTHS = 12;
 static const int CALENDAR_SYNC_FUTURE_MONTHS = 18;
 
-struct CalendarSyncRange {
-    time_t start;
-    time_t end;
-    string startStr;  // Formatted for CalDAV time-range filter
-    string endStr;
-};
-
 CalendarSyncRange getCalendarSyncRange() {
     time_t now = time(nullptr);
     time_t start = now - (CALENDAR_SYNC_PAST_MONTHS * 30 * 24 * 60 * 60);
@@ -678,6 +671,9 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
  Throws SyncException on transient errors; caller handles.
 */
 string DAVWorker::resolveCalendarHomeURL() {
+    if (ProviderUsesGraphCalendar(account->provider())) {
+        throw SyncException("no-caldav", "CalDAV is not available for this account", false);
+    }
     string domain = account->emailAddress().substr(account->emailAddress().find("@") + 1);
     string imapHost = account->IMAPHost();
     json payload = {{"domain", domain}, {"imapHost", imapHost}};
@@ -1372,6 +1368,11 @@ void DAVWorker::rebuildContactGroup(shared_ptr<Contact> contact) {
 }
 
 void DAVWorker::runCalendars() {
+    if (ProviderUsesGraphCalendar(account->provider())) {
+        // Calendars come from Microsoft Graph (GraphCalendarWorker); never probe for CalDAV.
+        return;
+    }
+
     // Gmail uses calHost/calPrincipal set in constructor.
     // All other accounts use dynamic discovery (cached after first run).
     string calendarHomeURL = "";

@@ -95,6 +95,8 @@
     <ClCompile Include="..\MailSync\DeltaStream.cpp" />
     <ClCompile Include="..\MailSync\GenericException.cpp" />
     <ClCompile Include="..\MailSync\GoogleContactsWorker.cpp" />
+    <ClCompile Include="..\MailSync\GraphCalendarWorker.cpp" />
+    <ClCompile Include="..\MailSync\GraphEventConverter.cpp" />
     <ClCompile Include="..\MailSync\MailProcessor.cpp" />
     <ClCompile Include="..\MailSync\MailStore.cpp" />
     <ClCompile Include="..\MailSync\MailStoreTransaction.cpp" />

@@ -171,6 +171,12 @@
     <ClCompile Include="..\MailSync\GoogleContactsWorker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\MailSync\GraphCalendarWorker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MailSync\GraphEventConverter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\MailSync\Models\ContactBook.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
