@@ -366,3 +366,46 @@ string GraphEventToICS(const json & event, vector<string> * warnings) {
     out += "END:VCALENDAR\r\n";
     return out;
 }
+
+bool GraphIsSeriesMaster(const json & item) {
+    return stringField(item, "type") == "seriesMaster";
+}
+
+bool GraphNeedsSeriesMerge(const json & item) {
+    if (GraphIsSeriesMaster(item)) return false;
+    if (stringField(item, "seriesMasterId").empty()) return false;
+    return stringField(item, "subject").empty();
+}
+
+// Whether a field carries no information. Graph sends sparse occurrences without these keys,
+// but placeholders such as a location with a blank displayName are treated the same way.
+static bool isBlankField(const string & key, const json & value) {
+    if (value.is_null()) return true;
+    if (value.is_string()) return value.get<string>().empty();
+    if (value.is_array() || value.is_object()) {
+        if (value.empty()) return true;
+        if (key == "location") return stringField(value, "displayName").empty();
+        if (key == "body") return stringField(value, "content").empty();
+    }
+    return false;
+}
+
+json GraphMergeSeriesMaster(const json & occurrence, const json & master) {
+    // Only descriptive fields come from the master; identity, timing and state stay the
+    // occurrence's own (id, iCalUId, start, end, type, isCancelled, changeKey, ...).
+    static const char * const inherited[] = {
+        "subject", "bodyPreview", "body", "location", "locations", "organizer", "attendees",
+        "categories", "showAs", "sensitivity", "importance", "isOnlineMeeting", "onlineMeeting",
+        "onlineMeetingUrl", "isAllDay", "isReminderOn", "webLink",
+    };
+    json merged = occurrence;
+    if (!occurrence.is_object() || !master.is_object()) return merged;
+    for (const char * key : inherited) {
+        auto source = master.find(key);
+        if (source == master.end() || isBlankField(key, *source)) continue;
+        auto own = merged.find(key);
+        if (own != merged.end() && !isBlankField(key, *own)) continue;
+        merged[key] = *source;
+    }
+    return merged;
+}

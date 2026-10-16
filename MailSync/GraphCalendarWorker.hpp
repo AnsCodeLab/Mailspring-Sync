@@ -12,6 +12,7 @@
 #ifndef GraphCalendarWorker_hpp
 #define GraphCalendarWorker_hpp
 
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -36,9 +37,17 @@ class GraphCalendarWorker : public CalendarSyncWorker {
 
     json graphGet(const string & url);
 
+    // State of the delta pass in flight (a worker runs one pass at a time): series masters by
+    // Graph id (null = unavailable), whether any master was delivered, and how many items of
+    // the pass were masters, which are not events and so do not count as received events.
+    map<string, json> masterCache;
+    bool sawSeriesMaster = false;
+    size_t passMasterItems = 0;
+
     void syncCalendarList();
     void syncCalendar(shared_ptr<Calendar> calendar);
-    void runDelta(shared_ptr<Calendar> calendar, const string & startURL, const GraphDeltaState & window, bool full);
+    bool runDelta(shared_ptr<Calendar> calendar, const string & startURL, const GraphDeltaState & window, bool full);
+    const json * seriesMaster(shared_ptr<Calendar> calendar, const string & masterId);
     size_t applyDeltaPage(shared_ptr<Calendar> calendar, const json & items, set<string> * seenEventIds);
     void removeEvents(vector<string> eventIds);
     void removeEventsNotIn(const string & calendarId, const set<string> & keepEventIds);

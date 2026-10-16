@@ -32,8 +32,13 @@ struct GraphDeltaState {
 // this long before the desired start is discarded so events that aged out get dropped.
 static const time_t GRAPH_MAX_WINDOW_LAG_SEC = 7 * 24 * 60 * 60;
 
+// Bump when stored events would differ for the same server data (e.g. how they are converted),
+// so tokens written by older builds trigger one full resync that rewrites them.
+static const int GRAPH_TOKEN_VERSION = 2;
+
 inline std::string GraphDeltaStateToToken(const GraphDeltaState & state) {
     nlohmann::json j = {
+        {"v", GRAPH_TOKEN_VERSION},
         {"deltaLink", state.deltaLink},
         {"windowStart", (long long)state.windowStart},
         {"windowEnd", (long long)state.windowEnd},
@@ -49,7 +54,8 @@ inline bool GraphDeltaStateFromToken(const std::string & token, GraphDeltaState 
     }
     try {
         nlohmann::json j = nlohmann::json::parse(token);
-        if (!j.is_object() || !j["deltaLink"].is_string() || !j["windowStart"].is_number_integer() || !j["windowEnd"].is_number_integer()) {
+        if (!j.is_object() || !j.contains("v") || j["v"] != GRAPH_TOKEN_VERSION ||
+            !j["deltaLink"].is_string() || !j["windowStart"].is_number_integer() || !j["windowEnd"].is_number_integer()) {
             return false;
         }
         GraphDeltaState parsed;
@@ -64,6 +70,13 @@ inline bool GraphDeltaStateFromToken(const std::string & token, GraphDeltaState 
     } catch (nlohmann::json::exception &) {
         return false;
     }
+}
+
+// A pass that saw an edited series master must be followed by a full resync: occurrences
+// carry a merged copy of their master's fields and only change on their own, so an incremental
+// pass cannot refresh them. A full pass already re-merges everything, so it never repeats.
+inline bool GraphShouldResyncAfterPass(bool wasFullPass, bool sawSeriesMaster) {
+    return !wasFullPass && sawSeriesMaster;
 }
 
 // True when the stored token cannot be continued incrementally: none/unusable, or its
@@ -111,6 +124,12 @@ inline std::string GraphDeltaStartURL(const std::string & graphCalendarId, time_
     return "https://graph.microsoft.com/v1.0/me/calendars/" + GraphUrlEncode(graphCalendarId) +
            "/calendarView/delta?startDateTime=" + GraphUrlEncode(GraphFormatISO8601UTC(windowStart)) +
            "&endDateTime=" + GraphUrlEncode(GraphFormatISO8601UTC(windowEnd));
+}
+
+// URL of one event of a calendar (used to fetch a series master).
+inline std::string GraphEventURL(const std::string & graphCalendarId, const std::string & graphEventId) {
+    return "https://graph.microsoft.com/v1.0/me/calendars/" + GraphUrlEncode(graphCalendarId) +
+           "/events/" + GraphUrlEncode(graphEventId);
 }
 
 // The bearer token is only ever sent to Graph: nextLink/deltaLink values come from the

@@ -628,6 +628,172 @@ static void testUrlTrustAndStaleToken() {
     CHECK(GraphPassUnusable(1, 1));
 }
 
+static json sparseOccurrence() {
+    return json::parse(R"({
+        "id": "AAMkOcc1=",
+        "iCalUId": "OCC-ICALUID",
+        "type": "occurrence",
+        "seriesMasterId": "AAMkMaster=",
+        "changeKey": "occKey",
+        "start": {"dateTime": "2025-02-05T09:00:00.0000000", "timeZone": "UTC"},
+        "end": {"dateTime": "2025-02-05T10:00:00.0000000", "timeZone": "UTC"},
+        "isCancelled": false,
+        "lastModifiedDateTime": "2025-01-20T00:00:00.0000000Z"
+    })");
+}
+
+static json fullMaster() {
+    return json::parse(R"({
+        "id": "AAMkMaster=",
+        "iCalUId": "MASTER-ICALUID",
+        "type": "seriesMaster",
+        "changeKey": "masterKey",
+        "subject": "E-BlueTeam Monthly Meeting",
+        "bodyPreview": "Monthly agenda",
+        "body": {"contentType": "html", "content": "<p>Monthly agenda</p>"},
+        "location": {"displayName": "Room 7"},
+        "organizer": {"emailAddress": {"name": "Alice Org", "address": "alice@example.com"}},
+        "attendees": [{"type": "required", "status": {"response": "accepted"}, "emailAddress": {"name": "Bob", "address": "bob@example.com"}}],
+        "categories": ["Blue"],
+        "showAs": "free",
+        "sensitivity": "private",
+        "isAllDay": false,
+        "isCancelled": true,
+        "start": {"dateTime": "2025-01-08T09:00:00.0000000", "timeZone": "UTC"},
+        "end": {"dateTime": "2025-01-08T10:00:00.0000000", "timeZone": "UTC"}
+    })");
+}
+
+static void testSeriesMerge() {
+    printf("series master merge\n");
+    json occ = sparseOccurrence();
+    json master = fullMaster();
+
+    CHECK(GraphIsSeriesMaster(master));
+    CHECK(!GraphIsSeriesMaster(occ));
+    CHECK(GraphNeedsSeriesMerge(occ));
+    CHECK(!GraphNeedsSeriesMerge(master));
+    json standalone = baseEvent();
+    CHECK(!GraphNeedsSeriesMerge(standalone));          // no seriesMasterId
+    json emptySubject = baseEvent();
+    emptySubject["subject"] = "";
+    CHECK(!GraphNeedsSeriesMerge(emptySubject));        // empty but not part of a series
+    json nullSubject = occ;
+    nullSubject["subject"] = nullptr;
+    CHECK(GraphNeedsSeriesMerge(nullSubject));
+    json emptyOcc = occ;
+    emptyOcc["subject"] = "";
+    CHECK(GraphNeedsSeriesMerge(emptyOcc));
+
+    // sparse occurrence gets the descriptive fields; its own identity and timing survive
+    json merged = GraphMergeSeriesMaster(occ, master);
+    CHECK_EQ(merged["subject"].get<string>(), "E-BlueTeam Monthly Meeting");
+    CHECK_EQ(merged["location"]["displayName"].get<string>(), "Room 7");
+    CHECK(merged["attendees"].size() == 1);
+    CHECK_EQ(merged["organizer"]["emailAddress"]["address"].get<string>(), "alice@example.com");
+    CHECK_EQ(merged["bodyPreview"].get<string>(), "Monthly agenda");
+    CHECK_EQ(merged["showAs"].get<string>(), "free");
+    CHECK_EQ(merged["sensitivity"].get<string>(), "private");
+    CHECK(merged["categories"][0] == "Blue");
+    CHECK(merged["isAllDay"] == false);
+    CHECK_EQ(merged["id"].get<string>(), "AAMkOcc1=");
+    CHECK_EQ(merged["iCalUId"].get<string>(), "OCC-ICALUID");
+    CHECK_EQ(merged["type"].get<string>(), "occurrence");
+    CHECK_EQ(merged["seriesMasterId"].get<string>(), "AAMkMaster=");
+    CHECK_EQ(merged["changeKey"].get<string>(), "occKey");
+    CHECK(merged["start"] == occ["start"]);
+    CHECK(merged["end"] == occ["end"]);
+    CHECK(merged["isCancelled"] == false);               // the master's true is not copied
+    CHECK_EQ(merged["lastModifiedDateTime"].get<string>(), "2025-01-20T00:00:00.0000000Z");
+    CHECK(!merged.contains("webLink"));                  // absent on both sides stays absent
+
+    // the merge result converts to a titled event at the occurrence's time
+    string ics = GraphEventToICS(merged);
+    auto cal = parse(ics);
+    ICalendarEvent * e = cal->Events.front();
+    CHECK_EQ(e->Summary, "E-BlueTeam Monthly Meeting");
+    CHECK_EQ(e->UID, GraphEventUID("AAMkOcc1="));
+    CHECK_EQ(string(e->DtStart), "20250205T090000");
+    CHECK(hasLine(ics, "X-MS-SERIES-MASTER-ID:AAMkMaster="));
+    CHECK(hasLine(ics, "X-MS-ICALUID:OCC-ICALUID"));
+    CHECK(!contains(ics, "STATUS:CANCELLED"));
+    CHECK(e->Attendees.size() == 1);
+
+    // non-blank occurrence fields are not overwritten
+    json own = occ;
+    own["subject"] = "";
+    own["location"] = {{"displayName", "Moved to Room 9"}};
+    own["showAs"] = "busy";
+    own["isAllDay"] = false;
+    own["attendees"] = json::array({{{"emailAddress", {{"name", "Zed"}, {"address", "zed@example.com"}}}}});
+    json mergedOwn = GraphMergeSeriesMaster(own, master);
+    CHECK_EQ(mergedOwn["subject"].get<string>(), "E-BlueTeam Monthly Meeting");
+    CHECK_EQ(mergedOwn["location"]["displayName"].get<string>(), "Moved to Room 9");
+    CHECK_EQ(mergedOwn["showAs"].get<string>(), "busy");
+    CHECK(mergedOwn["attendees"].size() == 1);
+    CHECK_EQ(mergedOwn["attendees"][0]["emailAddress"]["address"].get<string>(), "zed@example.com");
+
+    // blank placeholders on the occurrence are filled
+    json blank = occ;
+    blank["location"] = {{"displayName", ""}, {"locationType", "default"}};
+    blank["attendees"] = json::array();
+    blank["bodyPreview"] = nullptr;
+    json mergedBlank = GraphMergeSeriesMaster(blank, master);
+    CHECK_EQ(mergedBlank["location"]["displayName"].get<string>(), "Room 7");
+    CHECK(mergedBlank["attendees"].size() == 1);
+    CHECK_EQ(mergedBlank["bodyPreview"].get<string>(), "Monthly agenda");
+
+    // master with null / empty fields contributes nothing for them
+    json thin = master;
+    thin["location"] = nullptr;
+    thin["attendees"] = json::array();
+    thin["organizer"] = nullptr;
+    thin["subject"] = "Thin";
+    json mergedThin = GraphMergeSeriesMaster(occ, thin);
+    CHECK_EQ(mergedThin["subject"].get<string>(), "Thin");
+    CHECK(!mergedThin.contains("location") || mergedThin["location"].is_null());
+    CHECK(!mergedThin.contains("attendees"));
+    CHECK(!mergedThin.contains("organizer") || mergedThin["organizer"].is_null());
+    CHECK(!GraphEventToICS(mergedThin).empty());
+
+    // an exception with its own subject is left alone, and the merge function is a no-op for it
+    json exception = occ;
+    exception["type"] = "exception";
+    exception["subject"] = "Rescheduled review";
+    CHECK(!GraphNeedsSeriesMerge(exception));
+    json same = GraphMergeSeriesMaster(exception, master);
+    CHECK_EQ(same["subject"].get<string>(), "Rescheduled review");
+    CHECK(same["id"] == exception["id"]);
+
+    // non-object input is returned unchanged
+    CHECK(GraphMergeSeriesMaster(occ, nullptr) == occ);
+    CHECK(GraphMergeSeriesMaster(json(nullptr), master).is_null());
+
+    // pass-level rules: a master seen in an incremental pass forces one full resync, never two
+    CHECK(GraphShouldResyncAfterPass(false, true));
+    CHECK(!GraphShouldResyncAfterPass(true, true));
+    CHECK(!GraphShouldResyncAfterPass(false, false));
+    CHECK(!GraphShouldResyncAfterPass(true, false));
+    // masters are not events: a pass of only masters is not an "unusable" pass
+    CHECK(!GraphPassUnusable(3 - 3, 0));
+    CHECK(GraphPassUnusable(3 - 1, 2));
+
+    CHECK_EQ(GraphEventURL("CAL=", "AAMk/+="), "https://graph.microsoft.com/v1.0/me/calendars/CAL%3D/events/AAMk%2F%2B%3D");
+    CHECK(GraphIsTrustedURL(GraphEventURL("CAL=", "AAMk=")));
+
+    // tokens written before master handling carry no version and force one full resync
+    GraphDeltaState st;
+    st.deltaLink = "https://graph.microsoft.com/v1.0/x?$deltatoken=a";
+    st.windowStart = 1700000000;
+    st.windowEnd = 1760000000;
+    string legacy = "{\"deltaLink\":\"" + st.deltaLink + "\",\"windowStart\":1700000000,\"windowEnd\":1760000000}";
+    GraphDeltaState parsed;
+    CHECK(!GraphDeltaStateFromToken(legacy, parsed));
+    CHECK(GraphNeedsFullResync(legacy, 1700000000));
+    CHECK(GraphDeltaStateFromToken(GraphDeltaStateToToken(st), parsed));
+    CHECK(!GraphNeedsFullResync(GraphDeltaStateToToken(st), 1700000000));
+}
+
 int main() {
     testTimedEvent();
     testAllDayEvent();
@@ -644,6 +810,7 @@ int main() {
     testZoneNames();
     testConverterEdgeCases();
     testUrlTrustAndStaleToken();
+    testSeriesMerge();
 
     printf("%d checks, %d failure(s)\n", checks, failures);
     return failures == 0 ? 0 : 1;

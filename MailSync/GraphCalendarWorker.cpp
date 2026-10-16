@@ -223,16 +223,17 @@ void GraphCalendarWorker::syncCalendar(shared_ptr<Calendar> calendar) {
     string token = calendar->syncToken();
 
     GraphDeltaState state;
+    bool needsFull = true;
     if (!GraphNeedsFullResync(token, range.start) && GraphDeltaStateFromToken(token, state) && GraphIsTrustedURL(state.deltaLink)) {
         try {
-            runDelta(calendar, state.deltaLink, state, false);
-            return;
+            needsFull = runDelta(calendar, state.deltaLink, state, false);
         } catch (SyncException & e) {
             // 410 syncStateNotFound: the delta token expired server-side; 400: Graph rejects it.
             if (!GraphStatusMeansStaleDeltaToken(e.key)) throw;
             logger->info("Delta token for calendar '{}' rejected ({}); resyncing in full", calendar->name(), e.key);
         }
     }
+    if (!needsFull) return;
 
     GraphDeltaState window;
     window.windowStart = range.start;
@@ -241,9 +242,13 @@ void GraphCalendarWorker::syncCalendar(shared_ptr<Calendar> calendar) {
 }
 
 // Follows the delta pages from `startURL`. The new token is stored only after the last page is
-// applied, so an interrupted pass is repeated rather than skipped.
-void GraphCalendarWorker::runDelta(shared_ptr<Calendar> calendar, const string & startURL, const GraphDeltaState & window, bool full) {
+// applied, so an interrupted pass is repeated rather than skipped. Returns true when the pass
+// saw a series master and, being incremental, left it to the caller to resync in full.
+bool GraphCalendarWorker::runDelta(shared_ptr<Calendar> calendar, const string & startURL, const GraphDeltaState & window, bool full) {
     set<string> seen;
+    masterCache.clear();
+    sawSeriesMaster = false;
+    passMasterItems = 0;
     string next = startURL;
     string deltaLink;
     size_t items = 0;
@@ -268,9 +273,15 @@ void GraphCalendarWorker::runDelta(shared_ptr<Calendar> calendar, const string &
     if (!GraphIsTrustedURL(deltaLink)) {
         throw SyncException("graph-untrusted-url", "Delta response returned a deltaLink outside graph.microsoft.com", false);
     }
-    if (GraphPassUnusable(items, skipped)) {
+    if (GraphPassUnusable(items - passMasterItems, skipped)) {
         // Neither purge nor advance the token: the next pass retries from the same point.
-        throw SyncException("graph-bad-response", "Calendar '" + calendar->name() + "': all " + to_string(items) + " received event(s) were unusable", true);
+        throw SyncException("graph-bad-response", "Calendar '" + calendar->name() + "': all " + to_string(items - passMasterItems) + " received event(s) were unusable", true);
+    }
+    if (GraphShouldResyncAfterPass(full, sawSeriesMaster)) {
+        // An edited series: its occurrences hold a merged copy of the old master. The caller
+        // runs a full resync, which saves the token; nothing is saved here.
+        logger->info("Calendar '{}': a recurring series changed; resyncing in full", calendar->name());
+        return true;
     }
 
     if (full) {
@@ -282,6 +293,31 @@ void GraphCalendarWorker::runDelta(shared_ptr<Calendar> calendar, const string &
     calendar->setSyncToken(GraphDeltaStateToToken(state));
     store->save(calendar.get());
     logger->info("Calendar '{}': {} sync applied {} change(s)", calendar->name(), full ? "full" : "delta", items);
+    return false;
+}
+
+// Master of a series, from this pass's delta items or fetched once per pass; nullptr when the
+// server will not give it out (404/403), in which case the occurrence is stored as delivered.
+// Any other failure propagates and fails the pass.
+const json * GraphCalendarWorker::seriesMaster(shared_ptr<Calendar> calendar, const string & masterId) {
+    auto cached = masterCache.find(masterId);
+    if (cached != masterCache.end()) {
+        return cached->second.is_object() ? &cached->second : nullptr;
+    }
+    json fetched;
+    try {
+        fetched = graphGet(GraphEventURL(calendar->path(), masterId));
+    } catch (SyncException & e) {
+        if (!hasStatus(e, "Code: 404") && !hasStatus(e, "Code: 403")) throw;
+        logger->warn("Series master {} is unavailable ({}); storing its occurrences without it", masterId, e.key);
+        masterCache[masterId] = json(nullptr);
+        return nullptr;
+    }
+    if (!fetched.is_object() || stringValue(fetched, "id").empty()) {
+        masterCache[masterId] = json(nullptr);
+        return nullptr;
+    }
+    return &(masterCache[masterId] = fetched);
 }
 
 namespace {
@@ -312,10 +348,22 @@ size_t GraphCalendarWorker::applyDeltaPage(shared_ptr<Calendar> calendar, const 
     // Convert and parse outside the transaction so the write lock is held only for the saves.
     vector<DeltaOp> ops;
     size_t skipped = 0;
+    // Masters first so occurrences earlier on the page can use them without a request.
+    for (auto & item : items) {
+        if (item.contains("@removed") || !GraphIsSeriesMaster(item)) continue;
+        string masterId = stringValue(item, "id");
+        if (masterId.empty()) continue;
+        masterCache[masterId] = item;
+        sawSeriesMaster = true;
+        passMasterItems++;
+    }
     for (auto & item : items) {
         DeltaOp op;
         op.graphId = stringValue(item, "id");
         if (op.graphId.empty()) continue;
+        // The master is a data source only (cached above); storing it would show the first
+        // occurrence twice.
+        if (!item.contains("@removed") && GraphIsSeriesMaster(item)) continue;
 
         string eventId = MailUtils::idForEvent(account->id(), calendar->id(), GraphEventUID(op.graphId), "");
         if (item.contains("@removed")) {
@@ -329,9 +377,21 @@ size_t GraphCalendarWorker::applyDeltaPage(shared_ptr<Calendar> calendar, const 
         // convert must survive a full resync's purge of events that are gone.
         if (seenEventIds) seenEventIds->insert(eventId);
 
+        // Occurrences/exceptions arrive without their series' descriptive fields (see
+        // GraphMergeSeriesMaster); a master that cannot be read leaves them as delivered.
+        json merged;
+        const json * source = &item;
+        if (GraphNeedsSeriesMerge(item)) {
+            const json * master = seriesMaster(calendar, stringValue(item, "seriesMasterId"));
+            if (master != nullptr) {
+                merged = GraphMergeSeriesMaster(item, *master);
+                source = &merged;
+            }
+        }
+
         vector<string> warnings;
         try {
-            op.ics = GraphEventToICS(item, &warnings);
+            op.ics = GraphEventToICS(*source, &warnings);
         } catch (invalid_argument & e) {
             logger->warn("Skipping Graph event {}: {}", op.graphId, e.what());
             skipped++;
@@ -347,7 +407,7 @@ size_t GraphCalendarWorker::applyDeltaPage(shared_ptr<Calendar> calendar, const 
             skipped++;
             continue;
         }
-        op.hasUtcBounds = GraphEventUnixBounds(item, op.rs, op.re);
+        op.hasUtcBounds = GraphEventUnixBounds(*source, op.rs, op.re);
         ops.push_back(op);
     }
 

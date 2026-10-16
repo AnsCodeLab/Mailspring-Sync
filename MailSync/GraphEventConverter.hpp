@@ -32,6 +32,19 @@ std::string GraphEventToICS(const nlohmann::json & event, std::vector<std::strin
 // day windows use, so the library's value is kept) and for unusable input.
 bool GraphEventUnixBounds(const nlohmann::json & event, long long & rs, long long & re);
 
+// calendarView/delta lists a recurring series' master (type "seriesMaster", full data, start =
+// first occurrence) plus every occurrence as a sparse item without subject, body, location,
+// organizer or attendees. The master is only a data source and is never stored as an event.
+bool GraphIsSeriesMaster(const nlohmann::json & item);
+
+// True for an occurrence/exception (has seriesMasterId) whose own subject is missing or empty.
+bool GraphNeedsSeriesMerge(const nlohmann::json & item);
+
+// Returns `occurrence` with its blank descriptive fields filled from `master`. Non-blank
+// occurrence fields are kept; id, iCalUId, start, end, type, isCancelled, changeKey,
+// lastModifiedDateTime and seriesMasterId are never taken from the master.
+nlohmann::json GraphMergeSeriesMaster(const nlohmann::json & occurrence, const nlohmann::json & master);
+
 // The ICS UID for a Graph event id. Every occurrence/exception of a series has its own Graph
 // id, so the UID is derived from it rather than from the shared iCalUId.
 std::string GraphEventUID(const std::string & graphEventId);
