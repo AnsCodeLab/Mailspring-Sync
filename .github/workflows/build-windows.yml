@@ -2,7 +2,7 @@ name: Build Windows
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'feat/**']
   pull_request:
     branches: [main, master]
   create:
@@ -179,7 +179,7 @@ jobs:
           path: Windows/mailsync.tar.gz
 
       - name: Deploy to S3
-        if: github.ref == 'refs/heads/master'
+        if: github.ref == 'refs/heads/master' && github.repository == 'Foundry376/Mailspring-Sync'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -191,6 +191,35 @@ jobs:
           $s3Key = "mailsync/$env:COMMIT/win-ia32/mailsync.tar.gz"
 
           aws s3 cp $archivePath s3://mailspring-builds/$s3Key --acl public-read
+
+  # Publishes the Windows engine archive to the same mailsync-<short commit> release as the other
+  # platforms (see build.yml); the app's postinstall downloads it by the submodule hash.
+  publish-windows:
+    needs: build-windows
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/feat/'))
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: win-ia32-mailsync
+          path: engine
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="mailsync-${GITHUB_SHA:0:8}"
+          mv engine/mailsync.tar.gz engine/mailsync-win-ia32.tar.gz
+          # The other platforms' workflow publishes to the same release, so tolerate it creating it first.
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "Sync engine ${GITHUB_SHA:0:8}" \
+            --notes "Prebuilt sync engine for commit $GITHUB_SHA" \
+            || gh release view "$TAG" >/dev/null
+          gh release upload "$TAG" --clobber engine/mailsync-win-ia32.tar.gz
 
   # Run install-check in a separate job to verify SSL/TLS connectivity.
   # This validates that curl, OpenSSL, and mailcore2 are all working correctly.
