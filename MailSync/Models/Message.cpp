@@ -13,29 +13,36 @@
 #include "MailStore.hpp"
 #include "MailUtils.hpp"
 #include "Folder.hpp"
-#include "MailStore.hpp"
 #include "File.hpp"
 #include "Thread.hpp"
+#include "Placement.hpp"
 
 using namespace std;
 
 string Message::TABLE_NAME = "Message";
 
-/*
- The concept behind the "deletion placeholder" is that we need something 
- in the database with the remoteFolder and remoteUID of the message until
- we finish syncing the deletion to the server. Otherwise the sync worker 
- could put it back. (If you try to delete a lot of drafts and the deletion
- queue is long, the delay can be long enough for them to reappear.) Bad!
+static int flagBitsFor(bool unread, bool starred, bool draft) {
+    return (unread ? PLACEMENT_FLAG_UNREAD : 0)
+         | (starred ? PLACEMENT_FLAG_STARRED : 0)
+         | (draft ? PLACEMENT_FLAG_DRAFT : 0);
+}
 
- In this approach we "free" up the headerMessageId and id, and create an
- invisible message for a few seconds.
+/*
+ A deleted draft is replaced by an invisible placeholder message that takes over the
+ draft's (Drafts, UID) placement until the deletion reaches the server. Without it the
+ Drafts scan would see a UID it does not know and put the draft back. (If you delete a
+ lot of drafts and the deletion queue is long, the delay is long enough for that.)
+ The placeholder has a fresh id and headerMessageId so the draft's own can be reused
+ immediately. The caller moves the placements over; the placeholder starts with none.
 */
 shared_ptr<Message> Message::messageWithDeletionPlaceholderFor(shared_ptr<Message> draft) {
     json stubJSON = draft->toJSON(); // note: copy
     stubJSON["id"] = "deleted-" + MailUtils::idRandomlyGenerated();
     stubJSON["hMsgId"] = "deleted-" + stubJSON["id"].get<string>();
     stubJSON["subject"] = "Deleting...";
+    stubJSON["folders"] = json::object();
+    stubJSON["labels"] = json::array();
+    stubJSON.erase("rr");
     
     // very important to set v=0 so the Message gets both "added" and "deleted"
     // from the thread. Otherwise we could potentially cause double deletion
@@ -43,11 +50,9 @@ shared_ptr<Message> Message::messageWithDeletionPlaceholderFor(shared_ptr<Messag
     stubJSON["v"] = 0;
     
     auto stub = make_shared<Message>(stubJSON);
-    auto nolabels = json::array();
     stub->setDraft(false);
     stub->setUnread(false);
     stub->setStarred(false);
-    stub->setRemoteXGMLabels(nolabels);
     stub->setSyncUnsavedChanges(1);
     stub->setSyncedAt(time(0) + 1 * 60 * 60);
 
@@ -58,14 +63,15 @@ Message::Message(mailcore::IMAPMessage * msg, Folder & folder, time_t syncDataTi
 MailModel(MailUtils::idForMessage(folder.accountId(), folder.path(), msg), folder.accountId(), 0)
 {
     _skipThreadUpdatesAfterSave = false;
+    _placementsChanged = false;
+    _bodyFetched = false;
+    _rulesReadyForDispatch = false;
     _lastSnapshot = MessageEmptySnapshot;
     _data["_sa"] = syncDataTimestamp;
     _data["_suc"] = 0;
-    
-    setClientFolder(&folder);
-    setRemoteFolder(&folder);
-
-    _data["remoteUID"] = msg->uid();
+    // Only ingestion sets it, so rows written before it existed and client-authored drafts
+    // never become rules-ready.
+    _data["rr"] = RulesReadyAwaitingBody;
     
     _data["files"] = json::array();
     _data["date"] = msg->header()->date() == -1 ? msg->header()->receivedDate() : msg->header()->date();
@@ -88,6 +94,8 @@ MailModel(MailUtils::idForMessage(folder.accountId(), folder.path(), msg), folde
     if (folder.role() == "drafts") {
         _data["draft"] = true;
     }
+    _data["folders"] = json::object();
+    _data["folders"][folder.id()] = flagBitsFor(attrs.unread, attrs.starred, _data["draft"].get<bool>());
 
     _data["extraHeaders"] = json::object();
     auto extra = msg->header()->allExtraHeadersNames();
@@ -130,6 +138,9 @@ Message::Message(SQLite::Statement & query) :
     MailModel(query)
 {
     _skipThreadUpdatesAfterSave = false;
+    _placementsChanged = false;
+    _bodyFetched = false;
+    _rulesReadyForDispatch = false;
     _lastSnapshot = getSnapshot();
 }
 
@@ -137,6 +148,18 @@ Message::Message(json json) :
     MailModel(json)
 {
     _skipThreadUpdatesAfterSave = false;
+    _placementsChanged = false;
+    _bodyFetched = false;
+    _rulesReadyForDispatch = false;
+
+    // Client-authored draft JSON carries no "folders"; the engine assigns placements.
+    if (!_data.count("folders") || !_data["folders"].is_object()) {
+        _data["folders"] = json::object();
+    }
+    if (!_data.count("labels") || !_data["labels"].is_array()) {
+        _data["labels"] = json::array();
+    }
+
     if (version() == 0) {
         _lastSnapshot = MessageEmptySnapshot;
     } else {
@@ -148,10 +171,9 @@ MessageSnapshot Message::getSnapshot() {
     MessageSnapshot s;
     s.unread = isUnread();
     s.starred = isStarred();
-    s.inAllMail = inAllMail();
     s.fileCount = fileCountForThreadList();
-    s.remoteXGMLabels = remoteXGMLabels();
-    s.clientFolderId = clientFolderId();
+    s.labels = labels();
+    s.folders = folders();
     return s;
 }
 
@@ -185,14 +207,49 @@ bool Message::isHiddenReminder() {
 
 // mutable attributes
 
-bool Message::inAllMail() {
-    auto role = clientFolder()["role"].get<string>();
-    return role != "spam" && role != "trash";
+json & Message::folders() {
+    if (!_data["folders"].is_object()) {
+        _data["folders"] = json::object();
+    }
+    return _data["folders"];
+}
+
+vector<string> Message::folderIds() {
+    vector<string> ids;
+    for (auto it = folders().begin(); it != folders().end(); ++it) {
+        ids.push_back(it.key());
+    }
+    return ids;
+}
+
+string Message::folderRole(MailStore * store, string folderId) {
+    auto folder = store->folderById(accountId(), folderId);
+    return folder == nullptr ? "" : folder->role();
+}
+
+// A message is "in all mail" when at least one of its copies is somewhere other than
+// spam or trash. A message with no copies (in transit between folders) is not.
+bool Message::isInAllMail(MailStore * store, const string & accountId, const json & folderBits) {
+    for (auto it = folderBits.begin(); it != folderBits.end(); ++it) {
+        auto folder = store->folderById(accountId, it.key());
+        string role = folder == nullptr ? "" : folder->role();
+        if (role != "spam" && role != "trash") {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Message::inAllMail(MailStore * store) {
+    return isInAllMail(store, accountId(), folders());
 }
 
 bool Message::isUnread() {
     return _data["unread"].get<bool>();
 }
+
+// The flag setters write only the derived message-level value. Per-copy bits live on
+// the placements and reach "folders" through the MailStore helpers.
 
 void Message::setUnread(bool u) {
     _data["unread"] = u;
@@ -206,12 +263,8 @@ void Message::setStarred(bool s) {
     _data["starred"] = s;
 }
 
-json & Message::remoteXGMLabels() {
+json & Message::labels() {
     return _data["labels"];
-}
-
-void Message::setRemoteXGMLabels(json & labels) {
-    _data["labels"] = labels;
 }
 
 string Message::threadId() {
@@ -300,24 +353,71 @@ void Message::setDraft(bool d) {
 
 void Message::setBodyForDispatch(string s) {
     _bodyForDispatch = s;
+    _bodyFetched = true;
 }
 
-bool Message::isSentByUser() {
-    return this->_isIn("sent");
-}
-
-bool Message::isInInbox() {
-    return this->_isIn("inbox");
-}
-
-bool Message::_isIn(string roleAlsoLabelName) {
-    string folderRole = remoteFolder()["role"].get<string>();
-    if (folderRole == roleAlsoLabelName) {
-        return true;
+// MailProcessor::retrievedMessageBody is the only writer of received bodies. Bodies purged
+// from the cache later (SyncWorker::cleanMessageCache) still count.
+void Message::markBodyStored() {
+    if (_data.count("rr") && _data["rr"].get<int>() == RulesReadyAwaitingBody) {
+        _data["rr"] = RulesReadyHasBody;
     }
-    if (folderRole == "all") {
+}
+
+/*
+ Whether some copy makes this mail the user received rather than mail they sent, which is
+ what mail rules apply to. Sent and Drafts copies are the user's own. Spam and Trash copies
+ don't count either: their bodies are fetched only when the message is opened
+ (SyncWorker::shouldCacheBodiesInFolder), and rules should not depend on that. A message
+ that leaves Spam for Inbox counts from then on.
+
+ Gmail keeps one copy, in All Mail, and X-GM-LABELS say where it is filed. A message the
+ user sent carries \Sent (the send path copies the thread's user labels onto it too), so it
+ counts only once Gmail also files it under \Inbox, as it does self-addressed mail.
+ */
+bool Message::hasIncomingCopy(MailStore * store) {
+    for (auto & folderId : folderIds()) {
+        string role = folderRole(store, folderId);
+        if (role == "sent" || role == "drafts" || role == "spam" || role == "trash") {
+            continue;
+        }
+        if (role != "all") {
+            return true;
+        }
+        bool inInbox = false, outgoing = false;
+        for (auto & l : labels()) {
+            string name = l.get<string>();
+            inInbox = inInbox || name == "\\Inbox";
+            outgoing = outgoing || name == "\\Sent" || name == "\\Draft";
+        }
+        if (inInbox || !outgoing) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Message::isSentByUser(MailStore * store) {
+    return this->_isIn(store, "sent");
+}
+
+bool Message::isInInbox(MailStore * store) {
+    return this->_isIn(store, "inbox");
+}
+
+// True when any copy is in a folder with the given role, or (Gmail) in All Mail
+// carrying a label whose name contains it.
+bool Message::_isIn(MailStore * store, string roleAlsoLabelName) {
+    for (auto & folderId : folderIds()) {
+        string role = folderRole(store, folderId);
+        if (role == roleAlsoLabelName) {
+            return true;
+        }
+        if (role != "all") {
+            continue;
+        }
         string needle = roleAlsoLabelName;
-        for (auto & l : remoteXGMLabels()) {
+        for (auto & l : labels()) {
             string ln = l.get<string>();
             auto it = std::search(ln.begin(), ln.end(), needle.begin(), needle.end(), [](char ch1, char ch2) {
                 return std::toupper(ch1) == std::toupper(ch2);
@@ -328,49 +428,6 @@ bool Message::_isIn(string roleAlsoLabelName) {
         }
     }
     return false;
-}
-
-
-uint32_t Message::remoteUID() {
-    return _data["remoteUID"].get<uint32_t>();
-}
-
-void Message::setRemoteUID(uint32_t v) {
-    _data["remoteUID"] = v;
-}
-
-json Message::clientFolder() {
-    return _data["folder"];
-}
-
-string Message::clientFolderId() {
-    return _data["folder"]["id"].get<string>();
-}
-
-void Message::setClientFolder(Folder * folder) {
-    _data["folder"] = folder->toJSON();
-    if (_data["folder"].count("localStatus")) {
-        _data["folder"].erase("localStatus");
-    }
-}
-
-json Message::remoteFolder() {
-    return _data["remoteFolder"];
-}
-
-string Message::remoteFolderId() {
-    return _data["remoteFolder"]["id"].get<string>();
-}
-
-void Message::setRemoteFolder(json folder) {
-    _data["remoteFolder"] = folder;
-}
-
-void Message::setRemoteFolder(Folder * folder) {
-    _data["remoteFolder"] = folder->toJSON();
-    if (_data["remoteFolder"].count("localStatus")) {
-        _data["remoteFolder"].erase("localStatus");
-    }
 }
 
 time_t Message::syncedAt() {
@@ -387,6 +444,14 @@ int Message::syncUnsavedChanges() {
 
 void Message::setSyncUnsavedChanges(int t) {
     _data["_suc"] = t;
+}
+
+bool Message::placementsChanged() {
+    return _placementsChanged;
+}
+
+void Message::setPlacementsChanged(bool changed) {
+    _placementsChanged = changed;
 }
 
 // immutable attributes
@@ -432,7 +497,7 @@ string Message::tableName() {
 }
 
 vector<string> Message::columnsForQuery() {
-    return vector<string>{"id", "data", "accountId", "version", "headerMessageId", "subject", "gMsgId", "date", "draft", "unread", "starred", "remoteUID", "remoteXGMLabels", "remoteFolderId", "threadId"};
+    return vector<string>{"id", "data", "accountId", "version", "headerMessageId", "subject", "gMsgId", "date", "draft", "unread", "starred", "threadId"};
 }
 
 void Message::bindToQuery(SQLite::Statement * query) {
@@ -443,11 +508,52 @@ void Message::bindToQuery(SQLite::Statement * query) {
     query->bind(":draft", isDraft());
     query->bind(":headerMessageId", headerMessageId());
     query->bind(":subject", subject());
-    query->bind(":remoteUID", remoteUID());
-    query->bind(":remoteXGMLabels", remoteXGMLabels().dump());
-    query->bind(":remoteFolderId", remoteFolderId());
     query->bind(":threadId", threadId());
     query->bind(":gMsgId", gMsgId());
+}
+
+// Runs before bindToQuery serializes the JSON and before afterSave diffs the thread
+// against _lastSnapshot, so both see the rebuilt snapshot.
+void Message::beforeSave(MailStore * store) {
+    MailModel::beforeSave(store);
+    if (_placementsChanged) {
+        store->refreshMessageFromPlacements(*this);
+    }
+    _updateRulesReady(store);
+}
+
+/*
+ Mail rules run once per incoming message, on the delta that carries `rulesReady`. A message
+ becomes rules-ready on the first save where it has a stored body and an incoming copy
+ (hasIncomingCopy), whichever of the two arrived second: usually the body, but for
+ self-addressed mail the Sent copy and its body are stored at send time and the INBOX copy
+ arrives later. Mail whose only copies are in Sent or Drafts never becomes rules-ready. Mail
+ the account sent to others can once the user files it elsewhere; the client drops that by
+ its headers (MailRulesStore), where the account's aliases are known.
+
+ The state lives in _data and needs no query. That holds because every save of a message
+ reloads it inside the saving transaction, so a stale copy can never move "rr" backwards.
+
+ The delta always carries the body, for "Body contains" rules. When the incoming copy
+ arrived second, it is read back once here.
+ */
+void Message::_updateRulesReady(MailStore * store) {
+    _rulesReadyForDispatch = false;
+    if (!_data.count("rr") || _data["rr"].get<int>() != RulesReadyHasBody) {
+        return;
+    }
+    if (!hasIncomingCopy(store)) {
+        return;
+    }
+    _data["rr"] = RulesReadyEmitted;
+    _rulesReadyForDispatch = true;
+    if (_bodyForDispatch.empty()) {
+        SQLite::Statement query(store->db(), "SELECT value FROM MessageBody WHERE id = ? AND value IS NOT NULL");
+        query.bind(1, id());
+        if (query.executeStep()) {
+            _bodyForDispatch = query.getColumn(0).getString();
+        }
+    }
 }
 
 void Message::afterSave(MailStore * store) {
@@ -466,32 +572,28 @@ void Message::afterSave(MailStore * store) {
         return;
     }
 
-    auto allLabels = store->allLabelsCache(accountId());
-    thread->applyMessageAttributeChanges(_lastSnapshot, this, allLabels);
+    thread->applyMessageAttributeChanges(_lastSnapshot, this, store);
     store->save(thread.get());
     _lastSnapshot = getSnapshot();
 }
 
 void Message::afterRemove(MailStore * store) {
     MailModel::afterRemove(store);
-    
+
+    store->deletePlacementsForMessage(id());
+
     // if we have a thread, keep the thread's folder, label, and unread counters
     // in sync by providing it with a before + after snapshot of this message.
-    
-    if (threadId() == "") {
-        return;
-    }
-    auto thread = store->find<Thread>(Query().equal("id", threadId()));
-    if (thread == nullptr) {
-        return;
-    }
-    
-    auto allLabels = store->allLabelsCache(accountId());
-    thread->applyMessageAttributeChanges(_lastSnapshot, nullptr, allLabels);
-    if (thread->folders().size() == 0) {
-        store->remove(thread.get());
-    } else {
-        store->save(thread.get());
+    if (threadId() != "") {
+        auto thread = store->find<Thread>(Query().equal("id", threadId()));
+        if (thread != nullptr) {
+            thread->applyMessageAttributeChanges(_lastSnapshot, nullptr, store);
+            if (thread->folders().size() == 0) {
+                store->remove(thread.get());
+            } else {
+                store->save(thread.get());
+            }
+        }
     }
     
     // Also delete our draft body
@@ -504,7 +606,14 @@ json Message::toJSONDispatch() {
     json j = toJSON();
     if (_bodyForDispatch.length() > 0) {
         j["body"] = _bodyForDispatch;
-        j["fullSyncComplete"] = true;
+        // Deprecated: mail rules run on rulesReady. Kept for third-party plugins, and only
+        // sent when the body was just fetched, not when it was read back for rulesReady.
+        if (_bodyFetched) {
+            j["fullSyncComplete"] = true;
+        }
+    }
+    if (_rulesReadyForDispatch) {
+        j["rulesReady"] = true;
     }
     // We need to store this attribute because deltas can be flattened / concatenated together
     // in the buffer before they're sent to the client, so it's possible for the client to only

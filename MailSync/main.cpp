@@ -84,7 +84,8 @@ public:
     }
 
     void log(void * sender, ConnectionLogType logType, Data * buffer) {
-        if (buffer) {
+        // Private entries are AUTH commands and credential payloads.
+        if (buffer && logType != ConnectionLogTypeSentPrivate) {
             accumulated = accumulated + buffer->stringWithCharset("UTF-8")->UTF8Characters();
         }
     }
@@ -240,16 +241,36 @@ void runCalContactsSyncWorker(shared_ptr<Account> account) {
     std::this_thread::sleep_for(std::chrono::seconds(15 + account->startDelay()));
 
     // BG Note: This process does not use MailUtils::sleepWorkerUntilWakeOrSec(), which means
-    // cal + contact sync runs every 15 minutes regardless of how often you slam on the Sync Mail
-    // icon. I am trying to narrow down why we are hitting the Google Calendar + People API limits
-    // so quickly (in almost exactly 8 hours after the 2AM reset each day).
+    // cal + contact sync runs on a fixed cadence regardless of how often you slam on the Sync
+    // Mail icon. I am trying to narrow down why we are hitting the Google Calendar + People API
+    // limits so quickly (in almost exactly 8 hours after the 2AM reset each day).
 
-    while(true) {
+    // An unchanged calendar costs one PROPFIND (runCalendars() compares ctags first); every Gmail
+    // contact pass spends People API quota. Servers without ctag re-list every calendar per pass.
+    const auto calendarInterval = std::chrono::minutes(15);
+    const auto contactInterval = std::chrono::minutes(75);
+
+    // Due by elapsed time, since a pass can end in one of the long sleeps below. A failed
+    // contact pass counts as run, so a failing server is retried on the contact cadence.
+    bool contactsEverSynced = false;
+    auto lastContactSync = std::chrono::steady_clock::now();
+
+    for (unsigned long pass = 1; ; pass++) {
+        const auto now = std::chrono::steady_clock::now();
+        const bool syncContacts = !contactsEverSynced || now - lastContactSync >= contactInterval;
+        spdlog::get("logger")->info("Calendar sync pass {}{}", pass, syncContacts ? ", with contacts" : "");
         try {
-            if (contactsWorker) {
-                contactsWorker->run();
+            if (syncContacts) {
+                contactsEverSynced = true;
+                lastContactSync = now;
+                if (contactsWorker) {
+                    contactsWorker->run();
+                }
+                calendarWorker->run();
+            } else {
+                calendarWorker->runCalendars();
             }
-            calendarWorker->run();
+
         } catch (SyncException & ex) {
             exceptions::logCurrentExceptionWithStackTrace();
 
@@ -281,12 +302,12 @@ void runCalContactsSyncWorker(shared_ptr<Account> account) {
             return;
             // abort();
         }
-        std::this_thread::sleep_for(std::chrono::minutes(45));
+        std::this_thread::sleep_for(calendarInterval);
     }
 }
 
 
-int runTestAuth(shared_ptr<Account> account) {
+int runTestAuth(shared_ptr<Account> account, string & errorService) {
     AutoreleasePool pool;
 
     // Enable very detailed mailcore logging and redirect the messages to our accumulator log
@@ -301,13 +322,13 @@ int runTestAuth(shared_ptr<Account> account) {
     Array * folders;
     ErrorCode err = ErrorNone;
     Address * from = Address::addressWithMailbox(AS_MCSTR(account->emailAddress()));
-    string errorService = "imap";
     string tlsAdvice = "";
     string containerFolderPath = account->containerFolder();
     string mainPrefix = "";
     
     
     // imap
+    errorService = "imap";
     alogger.log("----------IMAP----------\n");
     MailUtils::configureSessionForAccount(session, account);
     session.setConnectionLogger(&alogger);
@@ -404,6 +425,47 @@ done:
         cout << resp.dump();
         return 1;
     }
+}
+
+// An exception out of runTestAuth reaches the terminate handler and aborts, leaving the
+// client no JSON and nothing to report but the exit code. The OAuth token refresh does
+// this routinely: a revoked refresh token is answered with 400, and an offline or
+// captive-portal machine fails the request outright. Neither is a crash, so report them
+// the way a bad password or unreachable host is already reported. error_offline carries
+// the isOffline() flag the client used to recover from the crash dump.
+int runTestAuthReportingExceptions(shared_ptr<Account> account) {
+    string errorService = "imap";
+    string error = "";
+    bool offline = false;
+
+    try {
+        return runTestAuth(account, errorService);
+    } catch (SyncException & ex) {
+        // isRetryable() already separates a network problem from refused credentials, and
+        // those are the two codes the client has localized strings for.
+        error = ex.isRetryable() ? "ErrorConnection" : "ErrorAuthentication";
+        offline = ex.isOffline();
+        alogger.log("\n\n" + ex.key + ": " + ex.debuginfo + "\n");
+    } catch (std::exception & ex) {
+        // Unclassified, so pass it through unrecognized and let the client report it.
+        error = ex.what();
+    } catch (...) {
+        error = "Unknown error";
+    }
+
+    if (error == "") {
+        error = "Unknown error"; // never hand the client a blank message
+    }
+
+    json resp = {
+        {"error", error},
+        {"error_service", errorService},
+        {"error_offline", offline},
+        {"log", alogger.accumulated},
+        {"account", nullptr}
+    };
+    cout << resp.dump();
+    return 1;
 }
 
 int runSingleFunctionAndExit(std::function<void()> fn) {
@@ -792,10 +854,19 @@ void runListenOnMainThread(shared_ptr<Account> account) {
                             ~RunningFlagReset() { flag = false; }
                         } reset { runningCalendarSync };
                         try {
-                            makeCalendarSyncWorker(account)->run();
+                            // Calendars only: contact sync spends a separate, scarcer API
+                            // quota and has no ctag early-out, so it keeps its own cadence
+                            // rather than riding every manual calendar refresh.
+                            makeCalendarSyncWorker(account)->runCalendars();
                         } catch (SyncException & ex) {
-                            // An uncaught exception on this detached thread would end the process.
-                            spdlog::get("logger")->error("Calendar sync failed: {}", ex.toJSON().dump(-1, ' ', false, json::error_handler_t::replace));
+                            // A refresh failing must not take the process down; the periodic
+                            // worker retries on its own schedule. Graph response bodies need
+                            // not be valid UTF-8, so they are dumped with replacement.
+                            if (ProviderUsesGraphCalendar(account->provider())) {
+                                spdlog::get("logger")->error("Calendar sync failed: {}", ex.toJSON().dump(-1, ' ', false, json::error_handler_t::replace));
+                            } else {
+                                exceptions::logCurrentExceptionWithStackTrace();
+                            }
                         } catch (...) {
                             exceptions::logCurrentExceptionWithStackTrace();
                         }
@@ -996,7 +1067,7 @@ string exectuablePath = argv[0];
     curl_global_init(CURL_GLOBAL_ALL);
 
     if (mode == "test") {
-        return runTestAuth(account);
+        return runTestAuthReportingExceptions(account);
     }
 
     if (mode == "sync") {

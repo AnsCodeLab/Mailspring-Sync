@@ -434,7 +434,10 @@ static long long localMidnight(int year, int month, int day) {
     return (long long)mktime(&parts);
 }
 
-static void testUtcBoundsUnderTimeZones() {
+// Event::applyICSEventData stores rs/re as Date::toUnix() of the parsed DTSTART/DTEND (DTSTART
+// again when there is no DTEND). The library treats a trailing `Z` as UTC and a bare date as a
+// local wall-clock, so the converter's output has to keep those two forms.
+static void testBoundsUnderTimeZones() {
     printf("rs/re under non-UTC process time zones\n");
     json timed = baseEvent();
     timed["start"] = {{"dateTime", "2025-01-15T09:00:00.0000000"}, {"timeZone", "UTC"}};
@@ -452,24 +455,11 @@ static void testUtcBoundsUnderTimeZones() {
         setZone(zone);
         printf("  TZ=%s\n", zone);
 
-        long long rs = 0, re = 0;
-        CHECK(GraphEventUnixBounds(timed, rs, re));
-        CHECK(rs == trueStart);
-        CHECK(re == trueEnd);
-
-        // The library alone reads the same text as local time, which is the bug the helper fixes.
         auto cal = parse(GraphEventToICS(timed));
-        long long libraryStart = cal->Events.front()->DtStart.toUnix();
-        if (string(zone) == "UTC") {
-            CHECK(libraryStart == trueStart);
-        } else {
-            CHECK(libraryStart != trueStart);
-        }
+        CHECK(cal->Events.front()->DtStart.toUnix() == trueStart);
+        CHECK(cal->Events.front()->DtEnd.toUnix() == trueEnd);
 
-        // All-day events keep local-midnight bounds from the library and get no UTC override.
-        long long ars = -1, are = -1;
-        CHECK(!GraphEventUnixBounds(allDay, ars, are));
-        CHECK(ars == -1 && are == -1);
+        // All-day events get local-midnight bounds, which is what the app's day windows use.
         auto dayCal = parse(GraphEventToICS(allDay));
         CHECK(dayCal->Events.front()->DtStart.toUnix() == localMidnight(2025, 1, 16));
         CHECK(dayCal->Events.front()->DtEnd.toUnix() == localMidnight(2025, 1, 17));
@@ -483,16 +473,6 @@ static void testUtcBoundsUnderTimeZones() {
     long long la = localMidnight(2025, 1, 16);
     CHECK(hcm != la);
     setZone("UTC");
-
-    // missing end: re falls back to rs; unusable start yields no override
-    json noEnd = timed;
-    noEnd.erase("end");
-    long long rs = 0, re = 0;
-    CHECK(GraphEventUnixBounds(noEnd, rs, re));
-    CHECK(rs == trueStart && re == trueStart);
-    json bad = timed;
-    bad["start"] = {{"dateTime", "garbage"}, {"timeZone", "UTC"}};
-    CHECK(!GraphEventUnixBounds(bad, rs, re));
 }
 
 static void testZoneNames() {
@@ -806,7 +786,7 @@ int main() {
     testInvalidInput();
     testDeltaBookkeeping();
     testTokenCache();
-    testUtcBoundsUnderTimeZones();
+    testBoundsUnderTimeZones();
     testZoneNames();
     testConverterEdgeCases();
     testUrlTrustAndStaleToken();

@@ -349,9 +349,8 @@ static struct mailimap_set * setFromIndexSet(IndexSet * indexSet)
     return imap_set;
 }
 
-static IndexSet * indexSetFromSet(struct mailimap_set * imap_set)
+static void addSetToIndexSet(IndexSet * indexSet, struct mailimap_set * imap_set)
 {
-    IndexSet * indexSet = IndexSet::indexSet();
     for(clistiter * cur = clist_begin(imap_set->set_list) ; cur != NULL ; cur = clist_next(cur)) {
         struct mailimap_set_item * item = (struct mailimap_set_item *) clist_content(cur);
         if (item->set_last == 0) {
@@ -364,6 +363,12 @@ static IndexSet * indexSetFromSet(struct mailimap_set * imap_set)
             indexSet->addRange(RangeMake(item->set_first, item->set_last - item->set_first));
         }
     }
+}
+
+static IndexSet * indexSetFromSet(struct mailimap_set * imap_set)
+{
+    IndexSet * indexSet = IndexSet::indexSet();
+    addSetToIndexSet(indexSet, imap_set);
     return indexSet;
 }
 
@@ -407,11 +412,12 @@ void IMAPSession::init()
     mFolderMsgCount = 0;
     mFirstUnseenUid = 0;
     mYahooServer = false;
+    mCoremailServer = false;
     mRamblerRuServer = false;
     mHermesServer = false;
     mQipServer = false;
     mOutlookServer = false;
-    mIdleVanishedMessages = NULL;
+    mVanishedMessages = new HashMap();
     mLastFetchedSequenceNumber = 0;
     mCurrentFolder = NULL;
     pthread_mutex_init(&mIdleLock, NULL);
@@ -436,7 +442,7 @@ IMAPSession::IMAPSession()
 
 IMAPSession::~IMAPSession()
 {
-    MC_SAFE_RELEASE(mIdleVanishedMessages);
+    MC_SAFE_RELEASE(mVanishedMessages);
     MC_SAFE_RELEASE(mUnparsedResponseData);
     MC_SAFE_RELEASE(mGmailUserDisplayName);
     MC_SAFE_RELEASE(mLoginResponse);
@@ -699,7 +705,16 @@ void IMAPSession::unsetup()
         mailimap_free(imap);
         imap = NULL;
     }
-    
+
+    // A new connection is told about these expunges again, and UIDVALIDITY may change
+    // before it is, so anything still undrained here is not safe to keep.
+    mVanishedMessages->removeAllObjects();
+
+    // Nothing is selected on the next connection until select() runs. Left set, this makes
+    // collectVanishedFromLastResponse() read the reconnect's LOGIN/NAMESPACE response as if
+    // it belonged to a selected mailbox.
+    MC_SAFE_RELEASE(mCurrentFolder);
+
     mState = STATE_DISCONNECTED;
 }
 
@@ -839,8 +854,9 @@ void IMAPSession::connectWithCurrentCompatibilityLevel(ErrorCode * pError)
     if (mImap->imap_response != NULL) {
         MC_SAFE_REPLACE_RETAIN(String, mWelcomeString, String::stringWithUTF8Characters(mImap->imap_response));
         mYahooServer = (mWelcomeString->locationOfString(MCSTR("yahoo.com")) != -1);
+        mCoremailServer = (mWelcomeString->locationOfString(MCSTR("Coremail System IMap Server Ready")) != -1);
 #ifdef LIBETPAN_HAS_MAILIMAP_163_WORKAROUND
-        if (mWelcomeString->locationOfString(MCSTR("Coremail System IMap Server Ready")) != -1)
+        if (mCoremailServer)
             mailimap_set_163_workaround_enabled(mImap, 1);
 #endif
         if (mWelcomeString->locationOfString(MCSTR("Courier-IMAP")) != -1) {
@@ -881,6 +897,10 @@ close:
 
 void IMAPSession::connectIfNeeded(ErrorCode * pError)
 {
+    // Every command funnels through here, so this is where we pick up VANISHED that arrived
+    // alongside the previous one. libetpan holds that response only until the next is parsed.
+    collectVanishedFromLastResponse();
+
     if (mShouldDisconnect) {
         disconnect();
         mShouldDisconnect = false;
@@ -1122,12 +1142,7 @@ void IMAPSession::login(ErrorCode * pError)
     enableFeatures();
 
     if (isAutomaticConfigurationEnabled()) {
-        // Some providers (notably NetEase 163/126/yeah.net) accept LOGIN but
-        // reject SELECT with "Unsafe Login" until the client sends RFC 2971 ID.
-        // Only perform the exchange when the caller supplied identity fields;
-        // the default identity is empty, preserving compatibility with servers
-        // whose malformed ID responses cannot be parsed by MailCore.
-        if (isIdentityEnabled() && clientIdentity()->allInfoKeys()->count() > 0) {
+        if (shouldSendClientIdentity()) {
             IMAPIdentity * serverIdentity = identity(clientIdentity(), pError);
             if (* pError != ErrorNone) {
                 MCLog("fetch identity failed");
@@ -1448,12 +1463,20 @@ void IMAPSession::noop(ErrorCode * pError)
     if (mImap->imap_stream != NULL) {
         r = mailimap_noop(mImap);
         if (r == MAILIMAP_ERROR_STREAM) {
+            // Note: like every other command here, so the next call reconnects instead of
+            // reusing a connection the server has closed (Dovecot's BYE on UIDVALIDITY change).
+            mShouldDisconnect = true;
             * pError = ErrorConnection;
         }
         if (r == MAILIMAP_ERROR_NOOP) {
             * pError = ErrorNoop;
         }
     }
+}
+
+String * IMAPSession::currentFolder()
+{
+    return mCurrentFolder;
 }
 
 #pragma mark mailbox flags conversion
@@ -2104,10 +2127,17 @@ void IMAPSession::moveMessages(String * folder, IndexSet * uidSet, String * dest
 }
 
 void IMAPSession::findUIDsOfRecentHeaderMessageID(String * folder, String * headerMessageID, IndexSet * uids) {
-    IndexSet * set = new IndexSet();
+    IndexSet * set = IndexSet::indexSet();
     ErrorCode err;
 
-    selectIfNeeded(folder, &err);
+    // Always re-SELECT: mFolderMsgCount is captured by select() alone and an untagged EXISTS
+    // does not refresh it, so on a folder this session already had selected the range below
+    // would stop short of a copy the SMTP gateway filed after that SELECT - on every retry.
+    loginIfNeeded(&err);
+    if (err != ErrorNone) {
+        return;
+    }
+    select(folder, &err);
     if (err != ErrorNone) {
         return;
     }
@@ -2816,7 +2846,10 @@ IMAPSyncResult * IMAPSession::fetchMessages(String * folder, IMAPMessagesRequest
     
     vanishedMessages = NULL;
     if (vanished != NULL) {
+        // mailimap_*_fetch_qresync hands us ownership of this struct.
         vanishedMessages = indexSetFromSet(vanished->qr_known_uids);
+        mailimap_qresync_vanished_free(vanished);
+        vanished = NULL;
     }
     
     mBodyProgressEnabled = true;
@@ -3838,33 +3871,9 @@ void IMAPSession::idle(String * folder, uint32_t lastKnownUID, ErrorCode * pErro
         return;
     }
 
-    // Extract VANISHED UIDs from the IDLE response before the next IMAP command
-    // overwrites rsp_extension_list. The server sends VANISHED during IDLE when
-    // messages are expunged, but won't re-report them in a subsequent FETCH
-    // CHANGEDSINCE since it considers this connection already informed.
-    MC_SAFE_RELEASE(mIdleVanishedMessages);
-    mIdleVanishedMessages = NULL;
-    if (mQResyncEnabled && mImap->imap_response_info != NULL) {
-        clistiter * cur;
-        for (cur = clist_begin(mImap->imap_response_info->rsp_extension_list);
-             cur != NULL; cur = clist_next(cur)) {
-            struct mailimap_extension_data * ext_data;
-            ext_data = (struct mailimap_extension_data *) clist_content(cur);
-            if (ext_data->ext_extension->ext_id != MAILIMAP_EXTENSION_QRESYNC) {
-                continue;
-            }
-            if (ext_data->ext_type != MAILIMAP_QRESYNC_TYPE_VANISHED) {
-                continue;
-            }
-            struct mailimap_qresync_vanished * vanished;
-            vanished = (struct mailimap_qresync_vanished *) ext_data->ext_data;
-            if (vanished != NULL && vanished->qr_known_uids != NULL) {
-                mIdleVanishedMessages = indexSetFromSet(vanished->qr_known_uids);
-                mIdleVanishedMessages->retain();
-            }
-            break;
-        }
-    }
+    // Harvest what the server reported while we idled, before the next command overwrites
+    // rsp_extension_list. A later FETCH CHANGEDSINCE will not repeat it.
+    collectVanishedFromLastResponse();
 
     * pError = ErrorNone;
 }
@@ -4438,10 +4447,39 @@ void IMAPSession::capabilitySetWithSessionState(IndexSet * capabilities)
     if (mailimap_has_extension(mImap, (char *)"MOVE")) {
         capabilities->addIndex(IMAPCapabilityMove);
     }
+    if (mailimap_has_uidplus(mImap)) {
+        capabilities->addIndex(IMAPCapabilityUIDPlus);
+    }
     if (mailimap_has_extension(mImap, (char *)"XYMHIGHESTMODSEQ")) {
         capabilities->addIndex(IMAPCapabilityXYMHighestModseq);
     }
     applyCapabilities(capabilities);
+}
+
+uint32_t IMAPSession::messageLimit()
+{
+    if (mImap == NULL || mImap->imap_connection_info == NULL ||
+        mImap->imap_connection_info->imap_capability == NULL) {
+        return 0;
+    }
+    clist * caps = mImap->imap_connection_info->imap_capability->cap_list;
+    for (clistiter * cur = clist_begin(caps); cur != NULL; cur = clist_next(cur)) {
+        struct mailimap_capability * cap = (struct mailimap_capability *) clist_content(cur);
+        if (cap->cap_type == MAILIMAP_CAPABILITY_NAME && cap->cap_data.cap_name != NULL &&
+            strncasecmp(cap->cap_data.cap_name, "MESSAGELIMIT=", 13) == 0) {
+            return (uint32_t) strtoul(cap->cap_data.cap_name + 13, NULL, 10);
+        }
+    }
+    return 0;
+}
+
+bool IMAPSession::lastResponseHitMessageLimit()
+{
+    // libetpan keeps the last unrecognised response code of each response in rsp_atom, and
+    // replaces imap_response_info for every response, so this reflects only the last command.
+    return mImap != NULL && mImap->imap_response_info != NULL &&
+        mImap->imap_response_info->rsp_atom != NULL &&
+        strcasecmp(mImap->imap_response_info->rsp_atom, "MESSAGELIMIT") == 0;
 }
 
 IndexSet * IMAPSession::storedCapabilities() {
@@ -4534,9 +4572,76 @@ void IMAPSession::setQResyncEnabled(bool enabled)
     }
 }
 
-IndexSet * IMAPSession::idleVanishedMessages()
+void IMAPSession::collectVanishedFromLastResponse()
 {
-    return mIdleVanishedMessages;
+    // Untagged VANISHED requires QRESYNC and always refers to the selected mailbox.
+    if (!mQResyncEnabled || mImap == NULL || mCurrentFolder == NULL) {
+        return;
+    }
+    // libetpan's extension commands (NAMESPACE, ID, SORT, ACL, ANNOTATEMORE) free the list
+    // and leave it NULL rather than empty after consuming their own response
+    // (libetpan/src/low-level/imap/namespace.c:105-108), and clist_begin() is a macro
+    // that dereferences its argument (libetpan/src/data-types/clist.h:106).
+    if (mImap->imap_response_info == NULL || mImap->imap_response_info->rsp_extension_list == NULL) {
+        return;
+    }
+
+    IndexSet * collected = NULL;
+
+    // One response can carry several VANISHED lines (one per expunge seen during a long
+    // IDLE), so walk the whole list rather than stopping at the first entry.
+    for (clistiter * cur = clist_begin(mImap->imap_response_info->rsp_extension_list);
+         cur != NULL; cur = clist_next(cur)) {
+        struct mailimap_extension_data * ext_data;
+        ext_data = (struct mailimap_extension_data *) clist_content(cur);
+        if (ext_data->ext_extension->ext_id != MAILIMAP_EXTENSION_QRESYNC) {
+            continue;
+        }
+        if (ext_data->ext_type != MAILIMAP_QRESYNC_TYPE_VANISHED) {
+            continue;
+        }
+        struct mailimap_qresync_vanished * vanished;
+        vanished = (struct mailimap_qresync_vanished *) ext_data->ext_data;
+        if (vanished == NULL) {
+            continue; // already claimed by libetpan's get_vanished() or by an earlier pass
+        }
+        // Claim it the way get_vanished() does, so a second pass can't report it twice.
+        ext_data->ext_data = NULL;
+        if (collected == NULL) {
+            // owned rather than autoreleased: this runs on every command, and not every
+            // thread driving a session holds an autorelease pool.
+            collected = new IndexSet();
+        }
+        addSetToIndexSet(collected, vanished->qr_known_uids);
+        mailimap_qresync_vanished_free(vanished);
+    }
+
+    if (collected == NULL) {
+        return;
+    }
+
+    IndexSet * existing = (IndexSet *) mVanishedMessages->objectForKey(mCurrentFolder);
+    if (existing != NULL) {
+        existing->addIndexSet(collected);
+    }
+    else {
+        mVanishedMessages->setObjectForKey(mCurrentFolder, collected);
+    }
+    MC_SAFE_RELEASE(collected);
+}
+
+IndexSet * IMAPSession::takeVanishedMessages(String * folder)
+{
+    collectVanishedFromLastResponse();
+
+    IndexSet * result = (IndexSet *) mVanishedMessages->objectForKey(folder);
+    if (result == NULL) {
+        return NULL;
+    }
+    result->retain();
+    result->autorelease();
+    mVanishedMessages->removeObjectForKey(folder);
+    return result;
 }
 
 bool IMAPSession::isIdentityEnabled()
@@ -4702,6 +4807,18 @@ bool IMAPSession::enableFeature(String * feature)
     mailimap_capability_data_free(result);
     
     return true;
+}
+
+// isIdentityEnabled() says the server supports RFC 2971 ID; this decides whether we send
+// ours. Coremail servers (NetEase 163/126/yeah.net and custom-domain hosts) accept LOGIN but
+// reject SELECT with "Unsafe Login" until the client sends ID (offlineimap #696,
+// nextcloud/mail #10679). The exchange is limited to them, and to callers that supplied
+// identity fields, because a failed ID aborts the login and other servers' ID responses
+// have not been audited against MailCore's parser. ID is optional (RFC 2971 §3), so the
+// servers that don't get one see what they always have.
+bool IMAPSession::shouldSendClientIdentity()
+{
+    return mCoremailServer && isIdentityEnabled() && clientIdentity()->allInfoKeys()->count() > 0;
 }
 
 void IMAPSession::enableFeatures()

@@ -87,6 +87,10 @@ GraphCalendarWorker::GraphCalendarWorker(shared_ptr<Account> account) :
 {
 }
 
+void GraphCalendarWorker::runCalendars() {
+    run();
+}
+
 void GraphCalendarWorker::run() {
     // The periodic loop and the sync-calendar trigger each own a worker; two concurrent passes
     // would race on the same calendars.
@@ -328,19 +332,7 @@ struct DeltaOp {
     string etag;
     string ics;              // CRLF text that is stored
     shared_ptr<ICalendar> parsed;
-    bool hasUtcBounds = false;
-    long long rs = 0;
-    long long re = 0;
 };
-
-// applyICSEventData derives rs/re with Date::toUnix(), which reads a `Z` time as local time.
-// For timed events the true UTC instants replace them; all-day events keep the local-midnight
-// bounds the app's day windows expect.
-void applyUtcBounds(Event & event, const DeltaOp & op) {
-    if (!op.hasUtcBounds) return;
-    event._data["rs"] = op.rs;
-    event._data["re"] = op.re;
-}
 }
 
 // Returns how many non-removal items could not be converted and were skipped.
@@ -407,7 +399,6 @@ size_t GraphCalendarWorker::applyDeltaPage(shared_ptr<Calendar> calendar, const 
             skipped++;
             continue;
         }
-        op.hasUtcBounds = GraphEventUnixBounds(*source, op.rs, op.re);
         ops.push_back(op);
     }
 
@@ -427,12 +418,10 @@ size_t GraphCalendarWorker::applyDeltaPage(shared_ptr<Calendar> calendar, const 
             // Full resyncs re-deliver everything; don't re-persist (and re-notify) what is unchanged.
             if (existing->etag() == op.etag && existing->icsData() == op.ics) continue;
             existing->applyICSEventData(op.etag, op.graphId, op.ics, icsEvent);
-            applyUtcBounds(*existing, op);
             store->save(existing.get());
         } else {
             Event event(op.etag, account->id(), calendar->id(), op.ics, icsEvent);
             event.setHref(op.graphId);
-            applyUtcBounds(event, op);
             store->save(&event);
         }
     }

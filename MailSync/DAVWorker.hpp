@@ -59,6 +59,10 @@ class DAVWorker : public CalendarSyncWorker {
     // In-memory discovery cache for CalDAV
     bool calendarsDiscoveryComplete = false;
     string cachedCalendarHomeURL = "";
+    // The DAV:href of this account's own principal, retained from discovery so that
+    // runCalendars() can compare it against each calendar's DAV:owner. Empty when the
+    // server named no principal, which leaves ownership unknown rather than wrong.
+    string cachedCalPrincipalPath = "";
 
     bool validateCachedAddressBook();
 
@@ -99,7 +103,7 @@ public:
     shared_ptr<Contact> ingestAddressDataNode(shared_ptr<DavXML> doc, xmlNodePtr node, bool & isGroup);
     void rebuildContactGroup(shared_ptr<Contact> contact);
 
-    void runCalendars();
+    void runCalendars() override;
     void runForCalendar(string id, string name, string path);
     bool runForCalendarWithSyncToken(string calendarId, string url, shared_ptr<Calendar> calendar, int retryCount = 0);
 

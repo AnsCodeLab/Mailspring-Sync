@@ -10,13 +10,8 @@
 
 #include <algorithm>
 #include <cctype>
-#include <ctime>
 #include <stdexcept>
 #include <vector>
-
-#ifdef _MSC_VER
-#define timegm _mkgmtime
-#endif
 
 using namespace std;
 using namespace nlohmann;
@@ -130,21 +125,6 @@ static bool isUTCZone(const string & zone) {
     return z == "utc" || z == "etc/utc" || z == "tzone://microsoft/utc" || z == "greenwich standard time";
 }
 
-// Seconds since the epoch for a Graph UTC date-time, independent of the process time zone.
-static bool utcUnix(const string & text, long long & out) {
-    string date, time;
-    if (!parseGraphDateTime(text, date, time)) return false;
-    tm parts {};
-    parts.tm_year = stoi(date.substr(0, 4)) - 1900;
-    parts.tm_mon = stoi(date.substr(4, 2)) - 1;
-    parts.tm_mday = stoi(date.substr(6, 2));
-    parts.tm_hour = stoi(time.substr(0, 2));
-    parts.tm_min = stoi(time.substr(2, 2));
-    parts.tm_sec = stoi(time.substr(4, 2));
-    out = (long long)timegm(&parts);
-    return true;
-}
-
 // Returns the ICS value for a Graph dateTimeTimeZone, e.g. 20250115T103000Z or, for all-day
 // events, 20250115.
 static string icsDateTime(const json & dtz, bool dateOnly, const char * what) {
@@ -202,21 +182,6 @@ static string partStat(const string & response) {
     if (response == "declined") return "DECLINED";
     if (response == "tentativelyAccepted") return "TENTATIVE";
     return "NEEDS-ACTION";
-}
-
-bool GraphEventUnixBounds(const json & event, long long & rs, long long & re) {
-    if (boolField(event, "isAllDay")) return false;
-    const json * start = objectField(event, "start");
-    if (start == nullptr) return false;
-    long long startUnix = 0;
-    if (!utcUnix(stringField(*start, "dateTime"), startUnix)) return false;
-    long long endUnix = startUnix;
-    if (const json * end = objectField(event, "end")) {
-        if (!utcUnix(stringField(*end, "dateTime"), endUnix)) endUnix = startUnix;
-    }
-    rs = startUnix;
-    re = endUnix;
-    return true;
 }
 
 string GraphEventToICS(const json & event, vector<string> * warnings) {

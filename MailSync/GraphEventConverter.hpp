@@ -26,12 +26,6 @@
 // but looks wrong (e.g. an all-day event that does not start at midnight).
 std::string GraphEventToICS(const nlohmann::json & event, std::vector<std::string> * warnings = nullptr);
 
-// Event.rs/re for a timed Graph event: the true UTC instants of its start and end. The
-// library's Date::toUnix() reads the same text as local time, which is wrong for `Z` times.
-// Returns false for all-day events (their bounds are local midnights, which is what the app's
-// day windows use, so the library's value is kept) and for unusable input.
-bool GraphEventUnixBounds(const nlohmann::json & event, long long & rs, long long & re);
-
 // calendarView/delta lists a recurring series' master (type "seriesMaster", full data, start =
 // first occurrence) plus every occurrence as a sparse item without subject, body, location,
 // organizer or attendees. The master is only a data source and is never stored as an event.

@@ -56,7 +56,9 @@ class GraphCalendarWorker : public CalendarSyncWorker {
 public:
     GraphCalendarWorker(shared_ptr<Account> account);
 
+    // Graph has no contacts work, so both entry points sync calendars.
     void run() override;
+    void runCalendars() override;
 };
 
 #endif /* GraphCalendarWorker_hpp */

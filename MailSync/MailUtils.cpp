@@ -19,6 +19,8 @@
 #include "Account.hpp"
 #include "Query.hpp"
 
+#include <random>
+
 #if defined(_MSC_VER)
 #include <direct.h>
 #include <codecvt>
@@ -57,8 +59,6 @@ static vector<string> unworthyPrefixes = {
     "catchall",
     "catch-all"
 };
-
-static bool calledsrand = false;
 
 bool create_directory(string dir) {
     int c = 0;
@@ -352,6 +352,9 @@ string MailUtils::roleForFolderViaFlags(string mainPrefix, IMAPFolder * folder) 
     if (flags & IMAPFolderFlagTrash) {
         return "trash";
     }
+    if (flags & IMAPFolderFlagArchive) {
+        return "archive";
+    }
     return "";
 }
 
@@ -369,7 +372,7 @@ string MailUtils::roleForFolderViaPath(string containerFolderPath, string mainPr
         path = path.substr(1);
     }
 
-    // Lowercase the path
+    string unprefixedPath = path;
     transform(path.begin(), path.end(), path.begin(), ::tolower);
     transform(containerFolderPath.begin(), containerFolderPath.end(), containerFolderPath.begin(), ::tolower);
 
@@ -396,39 +399,21 @@ string MailUtils::roleForFolderViaPath(string containerFolderPath, string mainPr
       }
     }
 
-    // Match against a lookup table of common names
-    // [Gmail]/Spam => [gmail]/spam => spam
-    if (COMMON_FOLDER_NAMES.find(path) != COMMON_FOLDER_NAMES.end()) {
-        return COMMON_FOLDER_NAMES[path];
+    // COMMON_FOLDER_NAMES is keyed by lowercase UTF-8, but LIST returns non-ASCII names in
+    // modified UTF-7 (RFC 3501 5.1.3), e.g. "Ko&AWE-" for "Koš".
+    String * name = AS_MCSTR(unprefixedPath);
+    if (unprefixedPath.find('&') != string::npos) {
+        String * decoded = name->mUTF7DecodedString();
+        if (decoded != nullptr) {
+            name = decoded;
+        }
+    }
+    auto common = COMMON_FOLDER_NAMES.find(name->lowercaseString()->UTF8Characters());
+    if (common != COMMON_FOLDER_NAMES.end()) {
+        return common->second;
     }
 
     return "";
-}
-
-int MailUtils::priorityForFolderRole(const string & role) {
-    // Mailspring's data model assumes each message exists in exactly one folder.
-    // However, some providers (notably iCloud) allow the same message to exist in
-    // multiple folders simultaneously. When this happens, we use folder priority
-    // to decide which folder "owns" the message, preventing it from flickering
-    // between folders on each sync cycle. Higher priority folders (lower numbers)
-    // always win, so messages "bubble up" to the most visible location (INBOX).
-    // This order matches the roleOrder array in SyncWorker.cpp:301.
-    static const map<string, int> priorities = {
-        {"inbox", 0},
-        {"sent", 1},
-        {"drafts", 2},
-        {"all", 3},
-        {"archive", 4},
-        {"trash", 5},
-        {"spam", 6}
-    };
-
-    auto it = priorities.find(role);
-    if (it != priorities.end()) {
-        return it->second;
-    }
-    // Custom folders (no role or unknown role) have lowest priority
-    return 100;
 }
 
 string MailUtils::pathForFile(string root, File * file, bool create) {
@@ -481,7 +466,7 @@ shared_ptr<Label> MailUtils::labelForXGMLabelName(string mlname, vector<shared_p
     return shared_ptr<Label>{};
 }
 
-vector<Query> MailUtils::queriesForUIDRangesInIndexSet(string remoteFolderId, IndexSet * set) {
+vector<Query> MailUtils::queriesForUIDRangesInIndexSet(string folderId, IndexSet * set) {
     vector<Query> results {};
     vector<uint32_t> uids {};
     
@@ -504,10 +489,12 @@ vector<Query> MailUtils::queriesForUIDRangesInIndexSet(string remoteFolderId, In
 
         if (right == UINT64_MAX) {
             // this range has a * upper bound, we need to represent it as a "uid > X" query.
-            results.push_back(Query().equal("remoteFolderId", remoteFolderId).gte("remoteUID", left));
+            results.push_back(Query().equal("folderId", folderId).gte("remoteUID", left));
         } else if (right - left > 50) {
-            // this range has many items, just express it as a bounded range query
-            results.push_back(Query().equal("remoteFolderId", remoteFolderId).gte("remoteUID", left).lt("remoteUID", right));
+            // this range has many items, just express it as a bounded range query. Both ends
+            // are inclusive because IndexSet ranges are. It has to be one BETWEEN clause -
+            // Query keys clauses by column, so chaining gte() and lte() drops the lower bound.
+            results.push_back(Query().equal("folderId", folderId).betweenInclusive("remoteUID", left, right));
         } else {
             // this range has a few items, throw them in a pile and we'll make a few queries for these specific UIDs
             for (uint64_t x = left; x <= right; x ++) {
@@ -518,7 +505,7 @@ vector<Query> MailUtils::queriesForUIDRangesInIndexSet(string remoteFolderId, In
 
     if (uids.size() > 0) {
         for (vector<uint32_t> chunk : MailUtils::chunksOfVector(uids, 200)) {
-            results.push_back(Query().equal("remoteFolderId", remoteFolderId).equal("remoteUID", chunk));
+            results.push_back(Query().equal("folderId", folderId).equal("remoteUID", chunk));
         }
     }
 
@@ -566,16 +553,18 @@ string MailUtils::idForFile(Message * message, Attachment * attachment) {
 }
 
 string MailUtils::idRandomlyGenerated() {
-    static string charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+    static const string charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+    // One generator per thread, seeded from the OS entropy source. Mailspring runs one mailsync
+    // process per account against a shared database, and Contact / ContactGroup use these IDs as
+    // their sole primary key - a time-seeded generator produced identical ID streams in two
+    // processes launched in the same second, and the second insert died on a UNIQUE violation.
+    static thread_local std::mt19937 generator{std::random_device{}()};
+    std::uniform_int_distribution<size_t> pick(0, charset.length() - 1);
+
     string result;
     result.resize(40);
-    
-    if (!calledsrand) {
-        srand((unsigned int)time(0));
-        calledsrand = true;
-    }
     for (int i = 0; i < 40; i++) {
-        result[i] = charset[rand() % charset.length()];
+        result[i] = charset[pick(generator)];
     }
     return result;
 }
@@ -758,9 +747,10 @@ class MailcoreSPDLogger : public ConnectionLogger {
             logTypeString = "sent";
             break;
 
+        // mailcore tags AUTH commands and their credential payloads (passwords,
+        // XOAUTH2 bearer tokens) as private; they must never reach the log.
         case ConnectionLogTypeSentPrivate:
-            logTypeString = "sent-private";
-            break;
+            return;
 
         case ConnectionLogTypeErrorParse:
             logTypeString = "error-parse";
@@ -782,28 +772,56 @@ class MailcoreSPDLogger : public ConnectionLogger {
     }
 };
 
-string MailUtils::tlsFailureAdvice(mailcore::ErrorCode err, mailcore::String * tlsErrorDescription, bool obsoleteTLSAllowed) {
+// OpenSSL reports "error:0A00018A:SSL routines::dh key too small". Only the reason
+// after the last "::" is worth showing; the full string stays in the connection log.
+static string _tlsRejectionReason(mailcore::String * tlsErrorDescription) {
     if (tlsErrorDescription == nullptr) {
         return "";
     }
-
-    // Only speak up when establishing the connection is what failed. Anything
-    // later - authentication above all - has its own cause, and a handshake
-    // reason recorded during a successful fallback would be a red herring.
-    if (err != mailcore::ErrorConnection &&
-        err != mailcore::ErrorTLSNotAvailable &&
-        err != mailcore::ErrorStartTLSNotAvailable &&
-        err != mailcore::ErrorCertificate) {
-        return "";
-    }
-
-    // OpenSSL reports "error:0A00018A:SSL routines::dh key too small". Only the
-    // reason after the last "::" is worth showing; the full string stays in the
-    // connection log.
     string reason = tlsErrorDescription->UTF8Characters();
     size_t sep = reason.rfind("::");
     if (sep != string::npos && sep + 2 < reason.size()) {
         reason = reason.substr(sep + 2);
+    }
+    return reason;
+}
+
+string MailUtils::tlsFailureAdvice(mailcore::ErrorCode err, mailcore::String * tlsErrorDescription, bool obsoleteTLSAllowed) {
+    string reason = _tlsRejectionReason(tlsErrorDescription);
+
+    // A certificate rejection carries no TLS reason string: mailcore runs checkCertificate()
+    // after the handshake has already succeeded, and IMAPSession::connect releases the
+    // description unless OpenSSL rejected the negotiation itself, so this case cannot be
+    // gated on one. It must also never point at "Allow insecure SSL", which only lowers the
+    // OpenSSL handshake security level and leaves validation on.
+    //
+    // The trust store is necessary but not always sufficient on macOS. The check there is
+    // SecPolicyCreateSSL(true, hostname), and under Apple's requirements for trusted
+    // certificates in iOS 13 / macOS 10.15 a TLS server certificate is rejected however the
+    // user has trusted it if it is SHA-1 signed, carries an RSA key under 2048 bits, has no
+    // DNS SAN, lacks the serverAuth EKU, or is valid for more than 825 days. The advice says
+    // so rather than promising that installing the certificate is always enough.
+    if (err == mailcore::ErrorCertificate) {
+        string advice = "Mailspring could not verify this server's certificate";
+        advice += reason.empty() ? string(". ") : " (" + reason + "). ";
+        advice += "If it is self-signed or issued by a private certificate authority, install it in "
+                  "your operating system's trust store (Keychain Access on macOS, the Windows "
+                  "certificate store, or the system CA directory on Linux) and reconnect - on macOS "
+                  "it must also meet Apple's current requirements for TLS server certificates. "
+                  "\"Allow insecure SSL\" does not bypass certificate validation.";
+        return advice;
+    }
+
+    // Otherwise only speak up when negotiating the connection is what failed, and only when
+    // OpenSSL said why. Anything later - authentication above all - has its own cause, and a
+    // handshake reason recorded during a successful fallback would be a red herring.
+    if (err != mailcore::ErrorConnection &&
+        err != mailcore::ErrorTLSNotAvailable &&
+        err != mailcore::ErrorStartTLSNotAvailable) {
+        return "";
+    }
+    if (reason.empty()) {
+        return "";
     }
 
     string advice = "The server rejected the secure connection (" + reason + "). ";
@@ -828,20 +846,14 @@ void MailUtils::configureSessionForAccount(IMAPSession &session, shared_ptr<Acco
     session.setHostname(AS_MCSTR(account->IMAPHost()));
     session.setPort(account->IMAPPort());
 
-    // NetEase's IMAP servers advertise RFC 2971 ID support and require clients
-    // to identify themselves after authentication. Without this, LOGIN, LIST,
-    // and STATUS succeed but SELECT is rejected with "Unsafe Login".
-    //
-    // MailCore's automatic ID exchange is enabled only when the client identity
-    // is non-empty, so providers with known-bad ID responses remain unaffected.
-    if (account->isNetEase()) {
-        IMAPIdentity clientIdentity;
-        clientIdentity.setName(MCSTR("Mailspring"));
-        clientIdentity.setVersion(MCSTR("1.0"));
-        clientIdentity.setVendor(MCSTR("Foundry 376"));
-        clientIdentity.setInfoForKey(MCSTR("support-email"), MCSTR("support@getmailspring.com"));
-        session.setClientIdentity(&clientIdentity);
-    }
+    // Coremail servers reject SELECT with "Unsafe Login" until the client sends RFC 2971
+    // ID. MailCore sends this identity only to servers whose greeting is Coremail's.
+    IMAPIdentity clientIdentity;
+    clientIdentity.setName(MCSTR("Mailspring"));
+    clientIdentity.setVersion(MCSTR("1.0"));
+    clientIdentity.setVendor(MCSTR("Foundry 376"));
+    clientIdentity.setInfoForKey(MCSTR("support-email"), MCSTR("support@getmailspring.com"));
+    session.setClientIdentity(&clientIdentity);
 
     if (account->IMAPSecurity() == "SSL / TLS") {
         session.setConnectionType(ConnectionType::ConnectionTypeTLS);
@@ -850,10 +862,15 @@ void MailUtils::configureSessionForAccount(IMAPSession &session, shared_ptr<Acco
     } else {
         session.setConnectionType(ConnectionType::ConnectionTypeClear);
     }
+    // Certificate validation stays enabled for every account, including this one: a
+    // self-signed certificate or a private internal CA belongs in the operating system
+    // trust store, which is where mailcore's check already looks (SecTrustEvaluate on
+    // macOS, the OpenSSL CA paths elsewhere), so the trust store is the allowlist and
+    // validation never has to be turned off. This option only lowers the OpenSSL handshake
+    // security level to 0, for undersized DH groups and legacy protocol versions. It does
+    // not weaken certificate validation, and on macOS it cannot reach it at all, because
+    // SecTrust is independent of OpenSSL. tlsFailureAdvice explains the rest to the user.
     if (account->IMAPAllowInsecureSSL()) {
-        session.setCheckCertificateEnabled(false);
-        // Also let the handshake itself fall back to OpenSSL security level 0,
-        // for servers still using SHA-1 certificates or undersized DH groups.
         session.setObsoleteTLSAllowed(true);
     }
 
@@ -894,8 +911,9 @@ void MailUtils::configureSessionForAccount(SMTPSession & session, shared_ptr<Acc
     } else {
         session.setConnectionType(ConnectionType::ConnectionTypeClear);
     }
+    // Certificate validation stays enabled here too; a self-signed certificate or private
+    // CA belongs in the operating system trust store. See the IMAP overload above.
     if (account->SMTPAllowInsecureSSL()) {
-        session.setCheckCertificateEnabled(false);
         session.setObsoleteTLSAllowed(true);
     }
 

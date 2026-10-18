@@ -188,6 +188,10 @@ namespace mailcore {
         virtual void disconnect();
         
         virtual void noop(ErrorCode * pError);
+
+        /** The folder this connection has SELECTed, or NULL when none is (the folder is
+            released on disconnect and on a failed select). Spelled as it was passed to select(). */
+        virtual String * currentFolder();
         
         virtual HashMap * fetchNamespace(ErrorCode * pError);
         
@@ -211,10 +215,12 @@ namespace mailcore {
         virtual bool isQResyncEnabled();
         virtual void setQResyncEnabled(bool enabled);
 
-        /** Returns UIDs of messages that were reported as VANISHED during the last IDLE session.
-            The caller should process these before issuing FETCH CHANGEDSINCE, because the server
-            may not re-report them. Returns NULL if no VANISHED was received. */
-        virtual IndexSet * idleVanishedMessages();
+        /** Returns - and clears - the UIDs reported VANISHED for `folder` on this connection
+            since the last call, or NULL if there were none. A QRESYNC server tells a given
+            connection about an expunge exactly once, and the untagged VANISHED can ride along
+            with any command, so callers must drain this before advancing HIGHESTMODSEQ.
+            `folder` is matched exactly, so spell it as it was passed to select(). */
+        virtual IndexSet * takeVanishedMessages(String * folder);
         virtual bool isIdentityEnabled();
         virtual bool isXOAuthEnabled();
         virtual bool isNamespaceEnabled();
@@ -258,6 +264,11 @@ namespace mailcore {
         virtual void resetAutomaticConfigurationDone();
         virtual void applyCapabilities(IndexSet * capabilities);
         virtual IndexSet * storedCapabilities();
+        // RFC 9738: N from a MESSAGELIMIT=N capability, or 0 when it is not advertised.
+        virtual uint32_t messageLimit();
+        // RFC 9738 §3: the last command's reply carried [MESSAGELIMIT ...], so the server
+        // processed only the highest-UID messages of the set.
+        virtual bool lastResponseHitMessageLimit();
         virtual void lockConnectionLogger();
         virtual void unlockConnectionLogger();
         virtual ConnectionLogger * connectionLoggerNoLock();
@@ -304,12 +315,13 @@ namespace mailcore {
         unsigned int mFolderMsgCount;
         uint32_t mFirstUnseenUid;
         bool mYahooServer;
+        bool mCoremailServer;
         bool mRamblerRuServer;
         bool mHermesServer;
         bool mQipServer;
         bool mOutlookServer;
 
-        IndexSet * mIdleVanishedMessages;
+        HashMap * mVanishedMessages; // folder path (String) -> IndexSet of vanished UIDs
         unsigned int mLastFetchedSequenceNumber;
         String * mCurrentFolder;
         pthread_mutex_t mIdleLock;
@@ -328,6 +340,7 @@ namespace mailcore {
         Data * mUnparsedResponseData;
         
         void init();
+        void collectVanishedFromLastResponse();
         void bodyProgress(unsigned int current, unsigned int maximum);
         void itemsProgress(unsigned int current, unsigned int maximum);
         bool checkCertificate();
@@ -346,6 +359,7 @@ namespace mailcore {
         void capabilitySetWithSessionState(IndexSet * capabilities);
         bool enableFeature(String * feature);
         void enableFeatures();
+        bool shouldSendClientIdentity();
         Data * fetchMessage(String * folder, bool identifier_is_uid, uint32_t identifier,
                             IMAPProgressCallback * progressCallback, ErrorCode * pError);
         void storeFlagsAndCustomFlags(String * folder, bool identifier_is_uid, IndexSet * identifiers,

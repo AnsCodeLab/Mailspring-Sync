@@ -22,7 +22,10 @@ inline bool ProviderUsesGraphCalendar(const std::string & provider) {
 class CalendarSyncWorker {
 public:
     virtual ~CalendarSyncWorker() = default;
+    // Everything this worker syncs: calendars plus, where the provider has any, contacts.
     virtual void run() = 0;
+    // Calendars only; used on the passes where contacts are not due.
+    virtual void runCalendars() = 0;
 };
 
 #endif /* CalendarSyncWorker_hpp */

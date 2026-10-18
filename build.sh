@@ -16,7 +16,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
   cd "$MAILSYNC_DIR"
   gem install xcpretty;
   # Without SIGN_BUILD=true the binary is ad-hoc signed, so builds without the
-  # Developer ID certificate (forks, pull requests, local checkouts) still succeed and run.
+  # Developer ID certificate (pull requests, local checkouts) still succeed and run.
   SIGNING_ARGS=()
   if [[ "$SIGN_BUILD" != "true" ]]; then
     SIGNING_ARGS=(CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=)
